@@ -25,11 +25,11 @@ import io.debezium.connector.postgresql.connection.ReplicationMessage;
 import io.debezium.connector.postgresql.connection.ReplicationMessage.Operation;
 import io.debezium.connector.postgresql.connection.ReplicationStream;
 import io.debezium.connector.postgresql.connection.WalPositionLocator;
-import io.debezium.connector.postgresql.spi.Snapshotter;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
 import io.debezium.relational.TableId;
+import io.debezium.snapshot.SnapshotterService;
 import io.debezium.util.Clock;
 import io.debezium.util.DelayStrategy;
 import io.debezium.util.ElapsedTimeStrategy;
@@ -64,7 +64,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     private final PostgresTaskContext taskContext;
     private final ReplicationConnection replicationConnection;
     private final AtomicReference<ReplicationStream> replicationStream = new AtomicReference<>();
-    private final Snapshotter snapshotter;
+    private final SnapshotterService snapshotterService;
     private final DelayStrategy pauseNoMessage;
     private final ElapsedTimeStrategy connectionProbeTimer;
 
@@ -82,7 +82,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     private Lsn lastCompletelyProcessedLsn;
     private PostgresOffsetContext effectiveOffset;
 
-    public PostgresStreamingChangeEventSource(PostgresConnectorConfig connectorConfig, Snapshotter snapshotter,
+    public PostgresStreamingChangeEventSource(PostgresConnectorConfig connectorConfig, SnapshotterService snapshotterService,
                                               PostgresConnection connection, PostgresEventDispatcher<TableId> dispatcher, ErrorHandler errorHandler, Clock clock,
                                               PostgresSchema schema, PostgresTaskContext taskContext, ReplicationConnection replicationConnection) {
         this.connectorConfig = connectorConfig;
@@ -93,7 +93,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         this.schema = schema;
         pauseNoMessage = DelayStrategy.constant(taskContext.getConfig().getPollInterval());
         this.taskContext = taskContext;
-        this.snapshotter = snapshotter;
+        this.snapshotterService = snapshotterService;
         this.replicationConnection = replicationConnection;
         this.connectionProbeTimer = ElapsedTimeStrategy.constant(Clock.system(), connectorConfig.statusUpdateInterval());
 
@@ -119,14 +119,15 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     @Override
     public void execute(ChangeEventSourceContext context, PostgresPartition partition, PostgresOffsetContext offsetContext)
             throws InterruptedException {
-        if (!snapshotter.shouldStream()) {
-            LOGGER.info("Streaming is not enabled in correct configuration");
+
+        if (!snapshotterService.getSnapshotter().shouldStream()) {
+            LOGGER.info("Streaming is not enabled in configuration");
             return;
         }
 
         lsnFlushingAllowed = false;
 
-        // replication slot could exist at the time of starting Debezium so we will stream from the position in the slot
+        // replication slot could exist at the time of starting Debezium, so we will stream from the position in the slot
         // instead of the last position in the database
         boolean hasStartLsnStoredInContext = offsetContext != null;
 
@@ -164,7 +165,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             this.lastCompletelyProcessedLsn = replicationStream.get().startLsn();
 
             if (walPosition.searchingEnabled()) {
-                searchWalPosition(context, stream, walPosition);
+                searchWalPosition(context, partition, this.effectiveOffset, stream, walPosition);
                 try {
                     if (!isInPreSnapshotCatchUpStreaming(this.effectiveOffset)) {
                         connection.commit();
@@ -333,7 +334,8 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         }
     }
 
-    private void searchWalPosition(ChangeEventSourceContext context, final ReplicationStream stream, final WalPositionLocator walPosition)
+    private void searchWalPosition(ChangeEventSourceContext context, PostgresPartition partition, PostgresOffsetContext offsetContext,
+                                   final ReplicationStream stream, final WalPositionLocator walPosition)
             throws SQLException, InterruptedException {
         AtomicReference<Lsn> resumeLsn = new AtomicReference<>();
         int noMessageIterations = 0;
@@ -350,6 +352,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 noMessageIterations = 0;
             }
             else {
+                dispatcher.dispatchHeartbeatEvent(partition, offsetContext);
                 noMessageIterations++;
                 if (noMessageIterations >= THROTTLE_NO_MESSAGE_BEFORE_PAUSE) {
                     noMessageIterations = 0;

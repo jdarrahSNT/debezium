@@ -7,6 +7,7 @@ package io.debezium.connector.mysql;
 
 import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.fail;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
@@ -26,6 +27,7 @@ import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.time.temporal.TemporalAccessor;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
@@ -34,10 +36,11 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.jdbc.JdbcValueConverters;
 import io.debezium.jdbc.TemporalPrecisionMode;
@@ -56,7 +59,7 @@ import io.debezium.util.Testing;
  * @author luobo
  */
 @SkipWhenDatabaseVersion(check = LESS_THAN, major = 5, minor = 6, reason = "DDL uses fractional second data types, not supported until MySQL 5.6")
-public class MysqlDefaultValueIT extends AbstractConnectorTest {
+public class MysqlDefaultValueIT extends AbstractAsyncEngineConnectorTest {
 
     // 4 meta events (set character_set etc.) and then 14 tables with 3 events each (drop DDL, create DDL, insert)
     private static final int EVENT_COUNT = 4 + 14 * 3;
@@ -73,7 +76,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
         DATABASE.createAndInitialize();
         initializeConnectorTestFramework();
         Testing.Files.delete(SCHEMA_HISTORY_PATH);
-        // TODO: remove once https://github.com/Apicurio/apicurio-registry/issues/2980 is fixed
+        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
         if (VerifyRecord.isApucurioAvailable()) {
             skipAvroValidation();
         }
@@ -91,7 +94,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
 
     @Override
     protected void validate(SourceRecord record) {
-        // TODO: remove once https://github.com/Apicurio/apicurio-registry/issues/2980 is fixed
+        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
         if (VerifyRecord.isApucurioAvailable()) {
             VerifyRecord.isValid(record, true);
         }
@@ -786,6 +789,41 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     }
 
     @Test
+    @FixFor("DBZ-7143")
+    @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
+    public void timeTypeWithConnectModeWhenEventConvertingFail() throws Exception {
+        config = DATABASE.defaultConfig()
+                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.INITIAL)
+                .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DATE_TIME_TABLE_CONNECT_FAIL"))
+                .with(MySqlConnectorConfig.TIME_PRECISION_MODE, TemporalPrecisionMode.CONNECT)
+                .with(CommonConnectorConfig.EVENT_CONVERTING_FAILURE_HANDLING_MODE, CommonConnectorConfig.EventConvertingFailureHandlingMode.FAIL)
+                .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, true)
+                .build();
+
+        AtomicReference<Throwable> exception = new AtomicReference<>();
+        start(MySqlConnector.class, config, (success, message, error) -> exception.set(error));
+
+        waitForSnapshotToBeCompleted("mysql", DATABASE.getServerName());
+
+        try (MySqlTestConnection db = MySqlTestConnection.forTestDatabase(DATABASE.getDatabaseName())) {
+            try (JdbcConnection connection = db.connect()) {
+                // CONNECT mode should be in range from 00:00:00 to 24:00:00
+                // it throws exception by FAIL mode when parse DDL because default value is invalid in CONNECT mode.
+                connection.execute("CREATE TABLE DATE_TIME_TABLE_CONNECT_FAIL (A TIME(1) DEFAULT '-23:45:56.7', B TIME(6) DEFAULT '123:00:00.123456');");
+            }
+        }
+        // Testing.Print.enable();
+
+        waitForConnectorShutdown("mysql", DATABASE.getServerName());
+
+        final Throwable e = exception.get();
+        if (e == null) {
+            // it should be thrown
+            fail();
+        }
+    }
+
+    @Test
     @FixFor("DBZ-771")
     @SkipWhenKafkaVersion(check = EqualityCheck.EQUAL, value = KafkaVersion.KAFKA_1XX, description = "Not compatible with Kafka 1.x")
     public void columnTypeAndDefaultValueChange() throws Exception {
@@ -906,7 +944,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     @FixFor("DBZ-4822")
     public void shouldConvertDefaultBoolean2Number() throws Exception {
         config = DATABASE.defaultConfig()
-                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.SCHEMA_ONLY)
+                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NO_DATA)
                 .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DBZ_4822_DEFAULT_BOOLEAN"))
                 .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, true)
                 .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)
@@ -952,7 +990,7 @@ public class MysqlDefaultValueIT extends AbstractConnectorTest {
     @FixFor("DBZ-5241")
     public void shouldConvertDefaultWithCharacterSetIntroducer() throws Exception {
         config = DATABASE.defaultConfig()
-                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.SCHEMA_ONLY)
+                .with(MySqlConnectorConfig.SNAPSHOT_MODE, MySqlConnectorConfig.SnapshotMode.NO_DATA)
                 .with(MySqlConnectorConfig.TABLE_INCLUDE_LIST, DATABASE.qualifiedTableName("DBZ_5241_DEFAULT_CS_INTRO"))
                 .with(SchemaHistory.STORE_ONLY_CAPTURED_TABLES_DDL, true)
                 .with(MySqlConnectorConfig.INCLUDE_SCHEMA_CHANGES, false)

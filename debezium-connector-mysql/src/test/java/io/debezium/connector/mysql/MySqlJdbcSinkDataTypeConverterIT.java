@@ -20,8 +20,9 @@ import org.junit.Test;
 import io.debezium.config.Configuration;
 import io.debezium.connector.mysql.converters.JdbcSinkDataTypesConverter;
 import io.debezium.data.Envelope;
+import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.util.Testing;
 
@@ -30,7 +31,7 @@ import io.debezium.util.Testing;
  *
  * @author Chris Cranford
  */
-public class MySqlJdbcSinkDataTypeConverterIT extends AbstractConnectorTest {
+public class MySqlJdbcSinkDataTypeConverterIT extends AbstractAsyncEngineConnectorTest {
 
     private static final Path SCHEMA_HISTORY_PATH = Testing.Files.createTestingPath("file-schema-history-jdbc-sink.text").toAbsolutePath();
 
@@ -55,6 +56,11 @@ public class MySqlJdbcSinkDataTypeConverterIT extends AbstractConnectorTest {
     @Test
     @FixFor("DBZ-6225")
     public void testBooleanDataTypeMapping() throws Exception {
+        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
+        if (VerifyRecord.isApucurioAvailable()) {
+            skipAvroValidation();
+        }
+
         final UniqueDatabase DATABASE = new UniqueDatabase("booleanit", "boolean_test").withDbHistoryPath(SCHEMA_HISTORY_PATH);
         DATABASE.createAndInitialize();
         Testing.Files.delete(SCHEMA_HISTORY_PATH);

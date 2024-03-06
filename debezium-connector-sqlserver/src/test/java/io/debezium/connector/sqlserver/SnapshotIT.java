@@ -220,7 +220,7 @@ public class SnapshotIT extends AbstractConnectorTest {
             final Struct value1 = (Struct) record1.value();
             assertRecord(key1, expectedKey1);
             assertRecord((Struct) value1.get("after"), expectedRow1);
-            assertThat(record1.sourceOffset()).hasSize(4);
+            assertThat(record1.sourceOffset()).hasSize(3);
 
             Assert.assertTrue(record1.sourceOffset().containsKey("change_lsn"));
             Assert.assertTrue(record1.sourceOffset().containsKey("commit_lsn"));
@@ -232,7 +232,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndStartStreaming() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .build();
 
         start(SqlServerConnector.class, config);
@@ -291,7 +291,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @Test
     public void takeSchemaOnlySnapshotAndSendHeartbeat() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(Heartbeat.HEARTBEAT_INTERVAL, 300_000)
                 .build();
 
@@ -595,7 +595,7 @@ public class SnapshotIT extends AbstractConnectorTest {
     @FixFor("DBZ-6811")
     public void shouldSendHeartbeatsWhenNoRecordsAreSent() throws Exception {
         final Configuration config = TestHelper.defaultConfig()
-                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.SCHEMA_ONLY)
+                .with(SqlServerConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
                 .with(Heartbeat.HEARTBEAT_INTERVAL, 100)
                 .build();
 

@@ -90,6 +90,16 @@ If the time needed to complete the initial snapshot exceeds the `UNDO_RETENTION`
 For more information about the error, and about the steps that you can take to recover from it, see the xref:what-causes-ora-01555-and-how-to-handle-it[Frequently asked questions].
 ====
 
+[IMPORTANT]
+====
+During a table's snapshot, it's possible for Oracle to raise an ORA-01466 exception.
+This happens when a user modifies the schema of the table or adds, changes, or drops an index or related object associated with the table being snapshot.
+In the event this happens, the connector will stop and the initial snapshot will need to be taken from the beginning.
+
+To remediate the problem, you can configure the xref:oracle-property-snapshot-database-errors-max-retries[`snapshot.database.errors.max.retries`] property with a value greater than `0` so that the specific table's snapshot will restart.
+While the entire snapshot will not start from the beginning when retrying, the specific table in question will be re-read from the beginning and the table's topic will contain duplicate snapshot events.
+====
+
 ifdef::product[]
 You can find more information about snapshots in the following sections:
 
@@ -174,14 +184,36 @@ After the snapshot completes, the connector begins to stream event records for s
 |The connector performs a database snapshot and stops before streaming any change event records, not allowing any subsequent change events to be captured.
 
 |`schema_only`
+|Deprecated, see `no_data`.
+
+|`no_data`
 |The connector captures the structure of all relevant tables, performing all of the steps described in the xref:default-workflow-for-performing-an-initial-snapshot[default snapshot workflow], except that it does not create `READ` events to represent the data set at the point of the connector's start-up (Step 6).
 
 |`schema_only_recovery`
+|Deprecated, see `recovery`.
+
+|`recovery`
 |Set this option to restore a database schema history topic that is lost or corrupted.
 After a restart, the connector runs a snapshot that rebuilds the topic from the source tables.
 You can also set the property to periodically prune a database schema history topic that experiences unexpected growth. +
  +
 WARNING: Do not use this mode to perform a snapshot if schema changes were committed to the database after the last connector shutdown.
+
+|`when_needed`
+|After the connector starts, it performs a snapshot only if it detects one of the following circumstances:
+
+* It cannot detect any topic offsets.
+* A previously recorded offset specifies a log position that is not available on the server.
+
+ifdef::community[]
+|`custom`
+|The `custom` snapshot mode lets you inject your own implementation of the `io.debezium.spi.snapshot.Snapshotter` interface.
+Set the `snapshot.mode.custom.name` configuration property to the name provided by the `name()` method of your implementation. 
+The name is specified on the classpath of your Kafka Connect cluster.
+If you use the {prodname} `EmbeddedEngine`, the name is included in the connector JAR file.
+For more information, see xref:connector-custom-snapshot[custom snapshotter SPI].
+endif::community[]
+
 |===
 
 For more information, see xref:oracle-property-snapshot-mode[`snapshot.mode`] in the table of connector configuration properties.
@@ -360,9 +392,15 @@ include::{partialsdir}/modules/all-connectors/proc-stopping-an-incremental-snaps
 
 include::{partialsdir}/modules/all-connectors/proc-stopping-an-incremental-snapshot-kafka.adoc[leveloffset=+1]
 
+ifdef::community[]
+[[connector-custom-snapshot]]
+=== Custom snapshotter SPI
+include::{partialsdir}/modules/all-connectors/custom-snapshotter-spi.adoc[leveloffset=+3]
+endif::community[]
+
 // Type: concept
 [id="oracle-blocking-snapshots"]
-==== Blocking snapshots
+=== Blocking snapshots
 
 include::{partialsdir}/modules/all-connectors/con-connector-blocking-snapshot.adoc[leveloffset=+3]
 
@@ -541,6 +579,8 @@ The message contains a logical representation of the table schema.
       "connector": "oracle",
       "name": "server1",
       "ts_ms": 1588252618953,
+      "ts_us": 1588252618953000,
+      "ts_ns": 1588252618953000000,
       "snapshot": "true",
       "db": "ORCLPDB1",
       "schema": "DEBEZIUM",
@@ -555,6 +595,8 @@ The message contains a logical representation of the table schema.
       "user_name": "user"
     },
     "ts_ms": 1588252618953, // <1>
+    "ts_us": 1588252618953987, // <1>
+    "ts_ns": 1588252618953987512, // <1>
     "databaseName": "ORCLPDB1", // <2>
     "schemaName": "DEBEZIUM", //
     "ddl": "CREATE TABLE \"DEBEZIUM\".\"CUSTOMERS\" \n   (    \"ID\" NUMBER(9,0) NOT NULL ENABLE, \n    \"FIRST_NAME\" VARCHAR2(255), \n    \"LAST_NAME" VARCHAR2(255), \n    \"EMAIL\" VARCHAR2(255), \n     PRIMARY KEY (\"ID\") ENABLE, \n     SUPPLEMENTAL LOG DATA (ALL) COLUMNS\n   ) SEGMENT CREATION IMMEDIATE \n  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 \n NOCOMPRESS LOGGING\n  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645\n  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1\n  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)\n  TABLESPACE \"USERS\" ", // <3>
@@ -643,8 +685,9 @@ The message contains a logical representation of the table schema.
 |Item |Field name |Description
 
 |1
-|`ts_ms`
-|Optional field that displays the time at which the connector processed the event. The time is based on the system clock in the JVM running the Kafka Connect task.
+|`ts_ms`, `ts_us`, `ts_ns`
+|Optional field that displays the time at which the connector processed the event.
+The time is based on the system clock in the JVM running the Kafka Connect task.
 
 In the source object, ts_ms indicates the time that the change was made in the database. By comparing the value for payload.source.ts_ms with the value for payload.ts_ms, you can determine the lag between the source database update and Debezium.
 
@@ -805,6 +848,8 @@ The following example shows a typical transaction event message:
   },
   "op": "c",
   "ts_ms": "1580390884335",
+  "ts_us": "1580390884335741",
+  "ts_ns": "1580390884335741963",
   "transaction": {
     "id": "5.6.641",
     "total_order": "1",
@@ -1251,6 +1296,16 @@ The following example shows the value of a _create_ event value from the `custom
                         "field": "ts_ms"
                     },
                     {
+                        "type": "int64",
+                        "optional": true,
+                        "field": "ts_us"
+                    },
+                    {
+                        "type": "int64",
+                        "optional": true,
+                        "field": "ts_ns"
+                    },
+                    {
                         "type": "string",
                         "optional": true,
                         "field": "txId"
@@ -1304,6 +1359,16 @@ The following example shows the value of a _create_ event value from the `custom
                 "type": "int64",
                 "optional": true,
                 "field": "ts_ms"
+            },
+            {
+                "type": "int64",
+                "optional": true,
+                "field": "ts_us"
+            },
+            {
+                "type": "int64",
+                "optional": true,
+                "field": "ts_ns"
             }
         ],
         "optional": false,
@@ -1321,6 +1386,8 @@ The following example shows the value of a _create_ event value from the `custom
             "version": "{debezium-version}",
             "name": "server1",
             "ts_ms": 1520085154000,
+            "ts_us": 1520085154000000,
+            "ts_ns": 1520085154000000000,
             "txId": "6.28.807",
             "scn": "2122185",
             "commit_scn": "2122185",
@@ -1331,7 +1398,9 @@ The following example shows the value of a _create_ event value from the `custom
             "snapshot": false
         },
         "op": "c",
-        "ts_ms": 1532592105975
+        "ts_ms": 1532592105975,
+        "ts_us": 1532592105975741,
+        "ts_ns": 1532592105975741582
     }
 }
 ----
@@ -1385,6 +1454,8 @@ The following example shows an _update_ change event that the connector captures
             "version": "{debezium-version}",
             "name": "server1",
             "ts_ms": 1520085811000,
+            "ts_us": 1520085811000000,
+            "ts_ns": 1520085811000000000,
             "txId": "6.9.809",
             "scn": "2125544",
             "commit_scn": "2125544",
@@ -1395,7 +1466,9 @@ The following example shows an _update_ change event that the connector captures
             "snapshot": false
         },
         "op": "u",
-        "ts_ms": 1532592713485
+        "ts_ms": 1532592713485,
+        "ts_us": 1532592713485152,
+        "ts_ns": 1532592713485152954,
     }
 }
 ----
@@ -1447,6 +1520,8 @@ The `schema` portion of the _delete_ event is identical to the `schema` portion 
             "version": "{debezium-version}",
             "name": "server1",
             "ts_ms": 1520085153000,
+            "ts_us": 1520085153000000,
+            "ts_ns": 1520085153000000000,
             "txId": "6.28.807",
             "scn": "2122184",
             "commit_scn": "2122184",
@@ -1457,7 +1532,9 @@ The `schema` portion of the _delete_ event is identical to the `schema` portion 
             "snapshot": false
         },
         "op": "d",
-        "ts_ms": 1532592105960
+        "ts_ms": 1532592105960,
+        "ts_us": 1532592105960854,
+        "ts_ns": 1532592105960854693
     }
 }
 ----
@@ -1501,6 +1578,8 @@ The message key is `null` in this case, the message value looks like this:
             "connector": "oracle",
             "name": "oracle_server",
             "ts_ms": 1638974535000,
+            "ts_us": 1638974535000000,
+            "ts_ns": 1638974535000000000,
             "snapshot": "false",
             "db": "ORCLPDB1",
             "sequence": null,
@@ -1517,6 +1596,8 @@ The message key is `null` in this case, the message value looks like this:
         },
         "op": "t", // <2>
         "ts_ms": 1638974558961, // <3>
+        "ts_us": 1638974558961987, // <3>
+        "ts_ns": 1638974558961987251, // <3>
         "transaction": null
     }
 }
@@ -1546,8 +1627,9 @@ a|Mandatory field that describes the source metadata for the event. In a _trunca
 a|Mandatory string that describes the type of operation. The `op` field value is `t`, signifying that this table was truncated.
 
 |3
-|`ts_ms`
-a|Optional field that displays the time at which the connector processed the event. The time is based on the system clock in the JVM running the Kafka Connect task. +
+|`ts_ms`, `ts_us`, `ts_ns`
+a|Optional field that displays the time at which the connector processed the event.
+The time is based on the system clock in the JVM running the Kafka Connect task. +
 
 In the `source` object, `ts_ms` indicates the time that the change was made in the database. By comparing the value for `payload.source.ts_ms` with the value for `payload.ts_ms`, you can determine the lag between the source database update and {prodname}.
 
@@ -2544,10 +2626,10 @@ You then need to create the following custom resources (CRs):
 
 .Prerequisites
 
-* Oracle Database is running and you completed the steps to {LinkDebeziumUserGuide}#setting-up-oracle-for-use-with-the-debezium-oracle-connector[set up Oracle to work with a {prodname} connector].
+* Oracle Database is running and you completed the steps to xref:setting-up-oracle-to-work-with-debezium[set up Oracle to work with a {prodname} connector].
 
 * {StreamsName} is deployed on OpenShift and is running Apache Kafka and Kafka Connect.
-  For more information, see link:{LinkDeployStreamsOpenShift}[{NameDeployStreamsOpenShift}]
+  For more information, see link:{LinkDeployManageStreamsOpenShift}[{NameDeployManageStreamsOpenShift}]
 
 * Podman or Docker is installed.
 
@@ -3056,16 +3138,29 @@ If the snapshot completes successfully, upon next connector start snapshot is no
 `initial_only`:: The snapshot includes the structure and data of the captured tables.
 The connector performs an initial snapshot and then stops, without processing any subsequent changes.
 
-`schema_only`:: The snapshot includes only the structure of captured tables.
+`schema_only`:: Deprecated, see `no-data`
+
+`no_data`:: The snapshot includes only the structure of captured tables.
 Specify this value if you want the connector to capture data only for changes that occur after the snapshot.
 
-`schema_only_recovery`:: This is a recovery setting for a connector that has already been capturing changes.
+`schema_only_recovery`:: Deprecated, see `recovery`.
+
+`recovery`:: This is a recovery setting for a connector that has already been capturing changes.
 When you restart the connector, this setting enables recovery of a corrupted or lost database schema history topic.
 You might set it periodically to "clean up" a database schema history topic that has been growing unexpectedly.
 Database schema history topics require infinite retention.
 Note this mode is only safe to be used when it is guaranteed that no schema changes happened since the point in time the connector was shut down before and the point in time the snapshot is taken.
 
 After the snapshot is complete, the connector continues to read change events from the database's redo logs except when `snapshot.mode` is configured as `initial_only`.
+
+`when_needed`:: After the connector starts, it performs a snapshot only if it detects one of the following circumstances:
+ 
+* It cannot detect any topic offsets.
+* A previously recorded offset specifies a log position that is not available on the server.
+
+ifdef::community[]
+`custom`:: The connector performs a snapshot according to the implementation specified by the xref:postgresql-property-snapshot-mode-custom-name[`snapshot.mode.custom.name`] property, which defines a custom implementation of the `io.debezium.spi.snapshot.Snapshotter` interface.
+endif::community[]
 
 For more information, see the xref:oracle-connector-snapshot-mode-options[table of `snapshot.mode` options].
 
@@ -3079,6 +3174,37 @@ You can set the following values:
 
 `none`:: Prevents the connector from acquiring any table locks during the snapshot.
   Use this setting only if no schema changes might occur during the creation of the snapshot.
+
+ifdef::community[]
+`custom`:: The connector performs a snapshot according to the implementation specified by the xref:oracle-property-snapshot-locking-mode-custom-name[`snapshot.locking.mode.custom.name`] property, which is a custom implementation of the `io.debezium.spi.snapshot.SnapshotLock` interface.
+endif::community[]
+
+ifdef::community[]
+|[[oracle-property-snapshot-locking-mode-custom-name]]<<oracle-property-snapshot-locking-mode-custom-name, `+snapshot.locking.mode.custom.name+`>>
+|No default
+| When `snapshot.locking.mode` is set as `custom`, use this setting to specify the name of the custom implementation provided in the `name()` method that is defined by the 'io.debezium.spi.snapshot.SnapshotLock' interface.
+For more information, see xref:connector-custom-snapshot[custom snapshotter SPI].
+endif::community[]
+
+|[[oracle-property-snapshot-query-mode]]<<oracle-property-snapshot-query-mode, `+snapshot.query.mode+`>>
+|`select_all`
+|Specifies how the connector queries data while performing a snapshot. +
+Set one of the following options:
+
+`select_all`:: The connector performs a `select all` query by default, optionally adjusting the columns selected based on the column include and exclude list configurations.
+
+ifdef::community[]
+`custom`:: The connector performs a snapshot query according to the implementation specified by the xref:oracle-property-snapshot-snapshot-query-mode-custom-name[`snapshot.query.mode.custom.name`] property, which defines a custom implementation of the `io.debezium.spi.snapshot.SnapshotQuery` interface. +
+endif::community[]
+
+This setting enables you to manage snapshot content in a more flexible manner compared to using the xref:oracle-property-snapshot-select-statement-overrides[`snapshot.select.statement.overrides`] property.
+
+ifdef::community[]
+|[[oracle-property-snapshot-snapshot-query-mode-custom-name]]<<oracle-property-snapshot-query-mode-custom-name, `+snapshot.query.mode.custom.name+`>>
+|No default
+| When xref:oracle-property-snapshot-query-mode[`snapshot.query.mode`] is set to `custom`, use this setting to specify the name of the custom implementation provided in the `name()` method that is defined by the 'io.debezium.spi.snapshot.SnapshotQuery' interface.
+For more information, see xref:connector-custom-snapshot[custom snapshotter SPI].
+endif::community[]
 
 |[[oracle-property-snapshot-include-collection-list]]<<oracle-property-snapshot-include-collection-list, `+snapshot.include.collection.list+`>>
 | All tables specified in the connector's xref:{context}-property-table-include-list[`table.include.list`] property.
@@ -3497,7 +3623,10 @@ This also enables tracking DDL changes against captured tables, so if the schema
  +
 `online_catalog`:: Uses the database's current data dictionary to resolve object ids and does not write any extra information to the online redo logs.
 This allows LogMiner to mine substantially faster but at the expense that DDL changes cannot be tracked.
-If the captured table(s) schema changes infrequently or never, this is the ideal choice.
+If the captured table(s) schema changes infrequently or never, this is the ideal choice. +
+ +
+`hybrid`:: Uses a combination of the database's current data dictionary and the {prodname} in-memory schema model to resole table and column names seamlessly.
+This mode performs at the level of the `online_catalog` LogMiner strategy with the schema tracking resilience of the `redo_log_catalog` strategy while not incurring the overhead of archive log generation and performance costs of the `redo_log_catalog` strategy.
 
 |[[oracle-property-log-mining-query-filter-mode]]<<oracle-property-log-mining-query-filter-mode, `+log.mining.query.filter.mode+`>>
 |`none`
@@ -3674,6 +3803,13 @@ If the difference between the timestamps is less than the specified value, and t
 Typically, multiple connectors can use the same flush table.
 However, if connectors encounter table lock contention errors, use this property to specify a dedicated table for each connector deployment.
 
+|[[oracle-property-log-mining-include-redo-sql]]<<oracle-property-log-mining-include-redo-sql, `+log.mining.include.redo.sql+`>>
+|`false`
+|Specifies whether the redo log constructed SQL statement is included in `source.redo_sql` field.
+ifdef::community[]
+This configuration is ignored when using XStream or OpenLogReplicator adapters.
+endif::community[]
+
 |[[oracle-property-lob-enabled]]<<oracle-property-lob-enabled, `+lob.enabled+`>>
 |`false`
 |Controls whether or not large object (CLOB or BLOB) column values are emitted in change events. +
@@ -3826,6 +3962,12 @@ These features provide early access to upcoming product features, enabling custo
 For more information about the support scope of Red Hat Technology Preview features, see link:https://access.redhat.com/support/offerings/techpreview/[Technology Preview Features Support Scope].
 ====
 endif::product[]
+
+|[[oracle-property-snapshot-database-errors-max-retries]]<oracle-property-snapshot-database-errors-max-retries, `snapshot.database.errors.max.retries`>>
+|`0`
+|Specifies the number of retry attempts to snapshot a table when a database error occurs.
+This configuration property currently only retries failures related to `ORA-01466` exceptions.
+By default, no additional retries will be performed.
 
 |[[oracle-property-custom-metric-tags]]<<oracle-property-custom-metric-tags, `custom.metric.tags`>>
 |`No default`
@@ -4076,6 +4218,10 @@ endif::community[]
 |`string[]`
 |An array of the most recent abandoned transaction identifiers removed from the transaction buffer due to their age.
 See <<oracle-property-log-mining-transaction-retention-ms, `log.mining.transaction.retention.ms`>> for details.
+
+|[[oracle-streaming-metrics-abandoned-transaction-count]]<<oracle-streaming-metrics-abandoned-transaction-count, `+AbandonedTransactionCount+`>>
+|`long`
+|Current number of entries in the xref:oracle-streaming-metrics-abandoned-transaction-ids[abandoned transactions] list.
 
 |[[oracle-streaming-metrics-rolled-back-transaction-ids]]<<oracle-streaming-metrics-rolled-back-transaction-ids, `+RolledBackTransactionIds+`>>
 |`string[]`
@@ -4918,19 +5064,29 @@ This will cause changes that occurred between the old SCN value and the newly pr
 This is not recommended.
 
 *What's the difference between the various mining strategies?*::
-The {prodname} Oracle connector provides two options for `log.mining.strategy`.
+The {prodname} Oracle connector provides three options for `log.mining.strategy`.
 +
 The default is `redo_in_catalog`, and this instructs the connector to write the Oracle data dictionary to the redo logs everytime a log switch is detected.
 This data dictionary is necessary for Oracle LogMiner to track schema changes effectively when parsing the redo and archive logs.
 This option will generate more than usual numbers of archive logs but allows tables being captured to be manipulated in real-time without any impact on capturing data changes.
 This option generally requires more Oracle database memory and will cause the Oracle LogMiner session and process to take slightly longer to start after each log switch.
 +
-The alternative option, `online_catalog`, does not write the data dictionary to the redo logs.
+The second option, `online_catalog`, does not write the data dictionary to the redo logs.
 Instead, Oracle LogMiner will always use the online data dictionary that contains the current state of the table's structure.
 This also means that if a table's structure changes and no longer matches the online data dictionary, Oracle LogMiner will be unable to resolve table or column names if the table's structure is changed.
 This mining strategy option should not be used if the tables being captured are subject to frequent schema changes.
 It's important that all data changes be lock-stepped with the schema change such that all changes have been captured from the logs for the table, stop the connector, apply the schema change, and restart the connector and resume data changes on the table.
 This option requires less Oracle database memory and Oracle LogMiner sessions generally start substantially faster since the data dictionary does not need to be loaded or primed by the LogMiner process.
++
+The final option, `hybrid`, combines the strengths of the above two strategies with none of their weaknesses.
+This strategy harnesses the performance of the `online_catalog` with the resilience in schema tracking of the `redo_in_catalog` while also avoiding the overhead and performance costs with the higher than normal archive log generation.
+This mode utilizes a fallback mode where if LogMiner fails to reconstruct the SQL for a database change, the {prodname} connector will rely on the in-memory schema model maintained by the connector to reconstruct the SQL in-flight.
+The intent is that this mode will eventually transition to the default, and likely only mode of operation in the future.
+
+*Are there any limitations with the Hybrid mining strategy with LogMiner?*::
+Yes, the Hybrid mode for `log.mining.strategy` is still a work-in-progress strategy, and therefore does not yet support all data types.
+At this time, this mode cannot reconstruct SQL statements that include operations against `CLOB`, `NCLOB`, `BLOB`, `XML`, nor `JSON` data types.
+So in short, if you enable `lob.enabled` with a value of `true`, you will be unable to use the Hybrid strategy and the connector will fail to start as this combination is unsupported.
 
 *Why does the connector appear to stop capturing changes on AWS?*::
 Due to the https://aws.amazon.com/blogs/networking-and-content-delivery/best-practices-for-deploying-gateway-load-balancer[fixed idle timeout of 350 seconds on the AWS Gateway Load Balancer],

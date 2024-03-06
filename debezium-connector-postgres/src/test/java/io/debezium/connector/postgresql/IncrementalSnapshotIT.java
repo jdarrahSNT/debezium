@@ -95,7 +95,7 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
 
     protected Configuration.Builder config() {
         return TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .with(PostgresConnectorConfig.SIGNAL_DATA_COLLECTION, "s1.debezium_signal")
                 .with(PostgresConnectorConfig.INCREMENTAL_SNAPSHOT_CHUNK_SIZE, 10)
@@ -117,7 +117,7 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
             tableIncludeList = "s1.a,s1.b";
         }
         return TestHelper.defaultConfig()
-                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER.getValue())
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA.getValue())
                 .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
                 .with(PostgresConnectorConfig.SIGNAL_DATA_COLLECTION, "s1.debezium_signal")
                 .with(CommonConnectorConfig.SIGNAL_POLL_INTERVAL_MS, 5)
@@ -155,6 +155,16 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
     }
 
     @Override
+    protected String noPKTopicName() {
+        return "test_server.s1.a42";
+    }
+
+    @Override
+    protected String noPKTableName() {
+        return "s1.a42";
+    }
+
+    @Override
     protected List<String> tableNames() {
         return List.of("s1.a", "s1.b");
     }
@@ -183,7 +193,7 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
     @Test
     @FixFor("DBZ-6481")
     public void insertsEnumPk() throws Exception {
-        Testing.Print.enable();
+        // Testing.Print.enable();
         final var enumValues = List.of("UP", "DOWN", "LEFT", "RIGHT", "STORY");
 
         try (JdbcConnection connection = databaseConnection()) {
@@ -287,28 +297,6 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
                 k -> k.getInt32("pk1") * 1_000 + k.getInt32("pk2") * 100 + k.getInt32("pk3") * 10 + k.getInt32("pk4"),
                 record -> ((Struct) record.value()).getStruct("after").getInt32(valueFieldName()),
                 "test_server.s1.a4",
-                null);
-        for (int i = 0; i < expectedRecordCount; i++) {
-            assertThat(dbChanges).contains(entry(i + 1, i));
-        }
-    }
-
-    @Test
-    public void insertsWithoutPks() throws Exception {
-        // Testing.Print.enable();
-
-        populate4WithoutPkTable();
-        startConnector();
-
-        sendAdHocSnapshotSignal("s1.a42");
-
-        final int expectedRecordCount = ROW_COUNT;
-        final Map<Integer, Integer> dbChanges = consumeMixedWithIncrementalSnapshot(
-                expectedRecordCount,
-                x -> true,
-                k -> k.getInt32("pk1") * 1_000 + k.getInt32("pk2") * 100 + k.getInt32("pk3") * 10 + k.getInt32("pk4"),
-                record -> ((Struct) record.value()).getStruct("after").getInt32(valueFieldName()),
-                "test_server.s1.a42",
                 null);
         for (int i = 0; i < expectedRecordCount; i++) {
             assertThat(dbChanges).contains(entry(i + 1, i));
@@ -423,12 +411,6 @@ public class IncrementalSnapshotIT extends AbstractIncrementalSnapshotTest<Postg
     protected void populate4PkTable() throws SQLException {
         try (JdbcConnection connection = databaseConnection()) {
             populate4PkTable(connection, "s1.a4");
-        }
-    }
-
-    protected void populate4WithoutPkTable() throws SQLException {
-        try (JdbcConnection connection = databaseConnection()) {
-            populate4PkTable(connection, "s1.a42");
         }
     }
 }

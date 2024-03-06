@@ -69,7 +69,6 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     private final DdlChanges ddlChanges;
     private final Map<Long, TableId> tableIdsByTableNumber = new ConcurrentHashMap<>();
     private final Map<Long, TableId> excludeTableIdsByTableNumber = new ConcurrentHashMap<>();
-    private boolean storageInitializationExecuted = false;
     private final MySqlConnectorConfig connectorConfig;
 
     /**
@@ -87,7 +86,8 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
                         connectorConfig.customConverterRegistry(),
                         connectorConfig.getSourceInfoStructMaker().schema(),
                         connectorConfig.getFieldNamer(),
-                        false),
+                        false,
+                        connectorConfig.getEventConvertingFailureHandlingMode()),
                 tableIdCaseInsensitive, connectorConfig.getKeyMapper());
 
         this.ddlParser = new MySqlAntlrDdlParser(
@@ -360,13 +360,6 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
     }
 
     /**
-     * Return true if the database schema history entity exists
-     */
-    public boolean historyExists() {
-        return schemaHistory.exists();
-    }
-
-    /**
      * Assign the given table number to the table with the specified {@link TableId table ID}.
      *
      * @param tableNumber the table number found in binlog events
@@ -413,16 +406,6 @@ public class MySqlDatabaseSchema extends HistorizedRelationalDatabaseSchema {
         LOGGER.debug("Clearing table number mappings");
         tableIdsByTableNumber.clear();
         excludeTableIdsByTableNumber.clear();
-    }
-
-    @Override
-    public void initializeStorage() {
-        super.initializeStorage();
-        storageInitializationExecuted = true;
-    }
-
-    public boolean isStorageInitializationExecuted() {
-        return storageInitializationExecuted;
     }
 
     @Override

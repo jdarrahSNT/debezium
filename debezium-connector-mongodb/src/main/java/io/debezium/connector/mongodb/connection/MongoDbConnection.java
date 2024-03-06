@@ -11,18 +11,19 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
 
 import org.bson.BsonTimestamp;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.mongodb.client.MongoClient;
 
 import io.debezium.DebeziumException;
+import io.debezium.config.Configuration;
 import io.debezium.connector.mongodb.CollectionId;
 import io.debezium.connector.mongodb.Filters;
 import io.debezium.connector.mongodb.MongoDbConnectorConfig;
-import io.debezium.connector.mongodb.MongoDbPartition;
-import io.debezium.connector.mongodb.MongoUtil;
+import io.debezium.connector.mongodb.MongoUtils;
 import io.debezium.function.BlockingConsumer;
 import io.debezium.function.BlockingFunction;
 import io.debezium.util.Clock;
@@ -34,6 +35,7 @@ import io.debezium.util.Metronome;
  */
 public final class MongoDbConnection implements AutoCloseable {
 
+    public static final Logger LOGGER = LoggerFactory.getLogger(MongoDbConnection.class);
     public static final String AUTHORIZATION_FAILURE_MESSAGE = "Command failed with error 13";
 
     @FunctionalInterface
@@ -46,18 +48,6 @@ public final class MongoDbConnection implements AutoCloseable {
         void onError(String desc, Throwable error);
     }
 
-    @FunctionalInterface
-    public interface ChangeEventSourceConnectionFactory {
-        /**
-         * Create connection for given replica set and partition
-         *
-         * @param replicaSet    the replica set information; may not be null
-         * @param partition      database partition
-         * @return connection based on given parameters
-         */
-        MongoDbConnection get(ReplicaSet replicaSet, MongoDbPartition partition);
-    }
-
     /**
      * A pause between failed MongoDB operations to prevent CPU throttling and DoS of
      * target MongoDB database.
@@ -67,20 +57,19 @@ public final class MongoDbConnection implements AutoCloseable {
     private final Filters filters;
     private final ErrorHandler errorHandler;
     private final AtomicBoolean running = new AtomicBoolean(true);
-    private final String name;
-    private final Supplier<MongoClient> connectionSupplier;
-    private final MongoDbConnectorConfig config;
+    private final MongoDbConnectorConfig connectorConfig;
 
-    protected MongoDbConnection(ReplicaSet replicaSet,
-                                MongoDbClientFactory clientFactory,
-                                MongoDbConnectorConfig config,
-                                Filters filters,
-                                ErrorHandler errorHandler) {
-        this.name = replicaSet.replicaSetName();
-        this.connectionSupplier = () -> clientFactory.client(replicaSet);
-        this.config = config;
-        this.filters = filters;
+    private final MongoDbConnectionContext connectionContext;
+
+    MongoDbConnection(Configuration config, ErrorHandler errorHandler) {
+        this.connectionContext = new MongoDbConnectionContext(config);
+        this.connectorConfig = connectionContext.getConnectorConfig();
+        this.filters = new Filters(config);
         this.errorHandler = errorHandler;
+    }
+
+    public MongoClient getMongoClient() {
+        return connectionContext.getMongoClient();
     }
 
     /**
@@ -106,7 +95,7 @@ public final class MongoDbConnection implements AutoCloseable {
     public <T> T execute(String desc, BlockingFunction<MongoClient, T> operation) throws InterruptedException {
         final Metronome errorMetronome = Metronome.sleeper(PAUSE_AFTER_ERROR, Clock.SYSTEM);
         while (true) {
-            try (var client = connectionSupplier.get()) {
+            try (var client = getMongoClient()) {
                 return operation.apply(client);
             }
             catch (InterruptedException e) {
@@ -115,7 +104,8 @@ public final class MongoDbConnection implements AutoCloseable {
             catch (Throwable t) {
                 errorHandler.onError(desc, t);
                 if (!isRunning()) {
-                    throw new DebeziumException("Operation failed and MongoDB connection to '" + name + "' termination requested", t);
+                    throw new DebeziumException(
+                            "Operation failed and MongoDB connection to '" + connectionContext.getMaskedConnectionString() + "' termination requested", t);
                 }
                 errorMetronome.pause();
             }
@@ -128,8 +118,8 @@ public final class MongoDbConnection implements AutoCloseable {
      * @return the database names; never null but possibly empty
      */
     public Set<String> databaseNames() throws InterruptedException {
-        if (config.getCaptureScope() == MongoDbConnectorConfig.CaptureScope.DATABASE) {
-            return config.getCaptureTarget()
+        if (connectorConfig.getCaptureScope() == MongoDbConnectorConfig.CaptureScope.DATABASE) {
+            return connectorConfig.getCaptureTarget()
                     .filter(dbName -> filters.databaseFilter().test(dbName))
                     .map(Set::of)
                     .orElse(Set.of());
@@ -138,7 +128,7 @@ public final class MongoDbConnection implements AutoCloseable {
         return execute("get database names", client -> {
             Set<String> databaseNames = new HashSet<>();
 
-            MongoUtil.forEachDatabaseName(
+            MongoUtils.forEachDatabaseName(
                     client,
                     dbName -> {
                         if (filters.databaseFilter().test(dbName)) {
@@ -161,8 +151,8 @@ public final class MongoDbConnection implements AutoCloseable {
             Set<String> databaseNames = databaseNames();
 
             for (String dbName : databaseNames) {
-                MongoUtil.forEachCollectionNameInDatabase(client, dbName, collectionName -> {
-                    CollectionId collectionId = new CollectionId(name, dbName, collectionName);
+                MongoUtils.forEachCollectionNameInDatabase(client, dbName, collectionName -> {
+                    CollectionId collectionId = new CollectionId(dbName, collectionName);
 
                     if (filters.collectionFilter().test(collectionId)) {
                         collections.add(collectionId);
@@ -183,7 +173,7 @@ public final class MongoDbConnection implements AutoCloseable {
     public BsonTimestamp hello() throws InterruptedException {
         return execute("ping on first available database", client -> {
             var dbName = databaseNames().stream().findFirst().orElse("admin");
-            return MongoUtil.hello(client, dbName);
+            return MongoUtils.hello(client, dbName);
         });
     }
 

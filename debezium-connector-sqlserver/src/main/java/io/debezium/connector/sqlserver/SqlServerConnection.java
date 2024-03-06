@@ -32,12 +32,15 @@ import org.slf4j.LoggerFactory;
 
 import com.microsoft.sqlserver.jdbc.SQLServerDriver;
 
+import io.debezium.DebeziumException;
 import io.debezium.annotation.VisibleForTesting;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.data.Envelope;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.pipeline.spi.OffsetContext;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
@@ -66,9 +69,12 @@ public class SqlServerConnection extends JdbcConnection {
     private static final String GET_MIN_LSN = "SELECT [#db].sys.fn_cdc_get_min_lsn('#')";
     private static final String LOCK_TABLE = "SELECT * FROM [#] WITH (TABLOCKX)";
     private static final String INCREMENT_LSN = "SELECT [#db].sys.fn_cdc_increment_lsn(?)";
-    private static final String GET_ALL_CHANGES_FOR_TABLE = "SELECT *# FROM [#db].cdc.[fn_cdc_get_all_changes_#](?, ?, N'all update old') order by [__$start_lsn] ASC, [__$seqval] ASC, [__$operation] ASC";
-    private final String get_all_changes_for_table;
     protected static final String LSN_TIMESTAMP_SELECT_STATEMENT = "TODATETIMEOFFSET([#db].sys.fn_cdc_map_lsn_to_time([__$start_lsn]), DATEPART(TZOFFSET, SYSDATETIMEOFFSET()))";
+    private static final String GET_ALL_CHANGES_FOR_TABLE_SELECT = "SELECT [__$start_lsn], [__$seqval], [__$operation], [__$update_mask], #, "
+            + LSN_TIMESTAMP_SELECT_STATEMENT;
+    private static final String GET_ALL_CHANGES_FOR_TABLE_FROM_FUNCTION = "FROM [#db].cdc.[fn_cdc_get_all_changes_#](?, ?, N'all update old')";
+    private static final String GET_ALL_CHANGES_FOR_TABLE_FROM_DIRECT = "FROM [#db].cdc.[#]";
+    private static final String GET_ALL_CHANGES_FOR_TABLE_ORDER_BY = "ORDER BY [__$start_lsn] ASC, [__$seqval] ASC, [__$operation] ASC";
 
     /**
      * Queries the list of captured column names and their change table identifiers in the given database.
@@ -130,40 +136,12 @@ public class SqlServerConnection extends JdbcConnection {
                                boolean useSingleDatabase) {
         super(config.getJdbcConfig(), createConnectionFactory(config.getJdbcConfig(), useSingleDatabase), OPENING_QUOTING_CHARACTER, CLOSING_QUOTING_CHARACTER);
 
+        this.logPositionValidator = this::validateLogPosition;
         defaultValueConverter = new SqlServerDefaultValueConverter(this::connection, valueConverters);
         this.queryFetchSize = config.getQueryFetchSize();
 
-        if (hasSkippedOperations(skippedOperations)) {
-            Set<String> skippedOps = new HashSet<>();
-            StringBuilder getAllChangesForTableStatement = new StringBuilder(
-                    "SELECT *# FROM [#db].cdc.[fn_cdc_get_all_changes_#](?, ?, N'all update old') WHERE __$operation NOT IN (");
-            skippedOperations.forEach((Envelope.Operation operation) -> {
-                // This number are the __$operation number in the SQLServer
-                // https://docs.microsoft.com/en-us/sql/relational-databases/system-functions/cdc-fn-cdc-get-all-changes-capture-instance-transact-sql?view=sql-server-ver15#table-returned
-                switch (operation) {
-                    case CREATE:
-                        skippedOps.add("2");
-                        break;
-                    case UPDATE:
-                        skippedOps.add("3");
-                        skippedOps.add("4");
-                        break;
-                    case DELETE:
-                        skippedOps.add("1");
-                        break;
-                }
-            });
-            getAllChangesForTableStatement.append(String.join(",", skippedOps));
-            getAllChangesForTableStatement.append(") order by [__$start_lsn] ASC, [__$seqval] ASC, [__$operation] ASC");
-            get_all_changes_for_table = getAllChangesForTableStatement.toString();
-        }
-        else {
-            get_all_changes_for_table = GET_ALL_CHANGES_FOR_TABLE;
+        getAllChangesForTable = buildGetAllChangesForTableQuery(config.getDataQueryMode(), skippedOperations);
 
-        }
-
-        getAllChangesForTable = get_all_changes_for_table.replaceFirst(STATEMENTS_PLACEHOLDER,
-                Matcher.quoteReplacement(", " + LSN_TIMESTAMP_SELECT_STATEMENT));
         this.config = config;
         this.useSingleDatabase = useSingleDatabase;
 
@@ -184,6 +162,51 @@ public class SqlServerConnection extends JdbcConnection {
         this(config, valueConverters, skippedOperations, useSingleDatabase);
 
         this.optionRecompile = optionRecompile;
+    }
+
+    private String buildGetAllChangesForTableQuery(SqlServerConnectorConfig.DataQueryMode dataQueryMode,
+                                                   Set<Envelope.Operation> skippedOperations) {
+        String result = GET_ALL_CHANGES_FOR_TABLE_SELECT + " ";
+        List<String> where = new LinkedList<>();
+        switch (dataQueryMode) {
+            case FUNCTION:
+                result += GET_ALL_CHANGES_FOR_TABLE_FROM_FUNCTION + " ";
+                break;
+            case DIRECT:
+                result += GET_ALL_CHANGES_FOR_TABLE_FROM_DIRECT + " ";
+                where.add("[__$start_lsn] >= ?");
+                where.add("[__$start_lsn] <= ?");
+                break;
+        }
+
+        if (hasSkippedOperations(skippedOperations)) {
+            Set<String> skippedOps = new HashSet<>();
+            skippedOperations.forEach((Envelope.Operation operation) -> {
+                // This number are the __$operation number in the SQLServer
+                // https://docs.microsoft.com/en-us/sql/relational-databases/system-functions/cdc-fn-cdc-get-all-changes-capture-instance-transact-sql?view=sql-server-ver15#table-returned
+                switch (operation) {
+                    case CREATE:
+                        skippedOps.add("2");
+                        break;
+                    case UPDATE:
+                        skippedOps.add("3");
+                        skippedOps.add("4");
+                        break;
+                    case DELETE:
+                        skippedOps.add("1");
+                        break;
+                }
+            });
+            where.add("[__$operation] NOT IN (" + String.join(",", skippedOps) + ")");
+        }
+
+        if (!where.isEmpty()) {
+            result += " WHERE " + String.join(" AND ", where) + " ";
+        }
+
+        result += GET_ALL_CHANGES_FOR_TABLE_ORDER_BY;
+
+        return result;
     }
 
     private boolean hasSkippedOperations(Set<Envelope.Operation> skippedOperations) {
@@ -330,8 +353,15 @@ public class SqlServerConnection extends JdbcConnection {
 
         int idx = 0;
         for (SqlServerChangeTable changeTable : changeTables) {
+            String capturedColumns = changeTable.getCapturedColumns().stream().map(c -> "[" + c + "]")
+                    .collect(Collectors.joining(", "));
+            String source = changeTable.getCaptureInstance();
+            if (config.getDataQueryMode() == SqlServerConnectorConfig.DataQueryMode.DIRECT) {
+                source = changeTable.getChangeTableId().table();
+            }
             final String query = replaceDatabaseNamePlaceholder(getAllChangesForTable, databaseName)
-                    .replace(STATEMENTS_PLACEHOLDER, changeTable.getCaptureInstance());
+                    .replaceFirst(STATEMENTS_PLACEHOLDER, Matcher.quoteReplacement(capturedColumns))
+                    .replace(STATEMENTS_PLACEHOLDER, source);
             queries[idx] = query;
             // If the table was added in the middle of queried buffer we need
             // to adjust from to the first LSN available
@@ -402,6 +432,7 @@ public class SqlServerConnection extends JdbcConnection {
     }
 
     public static class CdcEnabledTable {
+
         private final String tableId;
         private final String captureName;
         private final Lsn fromLsn;
@@ -423,6 +454,7 @@ public class SqlServerConnection extends JdbcConnection {
         public Lsn getFromLsn() {
             return fromLsn;
         }
+
     }
 
     public List<SqlServerChangeTable> getChangeTables(String databaseName) throws SQLException {
@@ -607,6 +639,13 @@ public class SqlServerConnection extends JdbcConnection {
     }
 
     @Override
+    public Optional<Boolean> nullsSortLast() {
+        // "Null values are treated as the lowest possible values"
+        // https://learn.microsoft.com/en-us/sql/t-sql/queries/select-order-by-clause-transact-sql?view=sql-server-ver16
+        return Optional.of(false);
+    }
+
+    @Override
     public String quotedTableIdString(TableId tableId) {
         return "[" + tableId.catalog() + "].[" + tableId.schema() + "].[" + tableId.table() + "]";
     }
@@ -629,5 +668,30 @@ public class SqlServerConnection extends JdbcConnection {
     public Optional<Instant> getCurrentTimestamp() throws SQLException {
         return queryAndMap("SELECT SYSDATETIMEOFFSET()",
                 rs -> rs.next() ? Optional.of(rs.getObject(1, OffsetDateTime.class).toInstant()) : Optional.empty());
+    }
+
+    public boolean validateLogPosition(OffsetContext offset, CommonConnectorConfig config) {
+
+        final Lsn storedLsn = ((SqlServerOffsetContext) offset).getChangePosition().getCommitLsn();
+
+        String oldestFirstChangeQuery = "SELECT TOP 1 [Current LSN] FROM sys.fn_dblog (NULL, NULL) ORDER BY [Current LSN] ASC";
+
+        try {
+            final String oldestScn = singleOptionalValue(oldestFirstChangeQuery, rs -> rs.getString(1));
+
+            if (oldestScn == null) {
+                return false;
+            }
+
+            LOGGER.trace("Oldest SCN in logs is '{}'", oldestScn);
+            return storedLsn == null || Lsn.valueOf(oldestScn).compareTo(storedLsn) < 0;
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Unable to get last available log position", e);
+        }
+    }
+
+    public <T> T singleOptionalValue(String query, ResultSetExtractor<T> extractor) throws SQLException {
+        return queryAndMap(query, rs -> rs.next() ? extractor.apply(rs) : null);
     }
 }

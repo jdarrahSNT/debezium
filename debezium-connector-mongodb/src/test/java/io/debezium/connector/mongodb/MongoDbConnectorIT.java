@@ -54,6 +54,7 @@ import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
 import io.debezium.config.Field;
 import io.debezium.connector.mongodb.MongoDbConnectorConfig.FiltersMatchMode;
+import io.debezium.connector.mongodb.MongoDbConnectorConfig.FullUpdateType;
 import io.debezium.converters.CloudEventsConverterTest;
 import io.debezium.data.Envelope;
 import io.debezium.data.Envelope.Operation;
@@ -112,6 +113,19 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         assertNoConfigurationErrors(result, MongoDbConnectorConfig.SSL_ENABLED);
         assertNoConfigurationErrors(result, MongoDbConnectorConfig.SSL_ALLOW_INVALID_HOSTNAMES);
         assertNoConfigurationErrors(result, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
+    }
+
+    @Test
+    public void shouldFailToValidateWithReplicaSetModeParams() {
+        config = TestHelper.getConfiguration(mongo)
+                .edit()
+                .with(MongoDbConnector.DEPRECATED_SHARD_CS_PARAMS_FILED, "readPreference=primary")
+                .with(MongoDbConnector.DEPRECATED_CONNECTION_MODE_FILED, "replica_set")
+                .build();
+        MongoDbConnector connector = new MongoDbConnector();
+        Config result = connector.validate(config.asMap());
+
+        assertConfigurationErrors(result, MongoDbConnectorConfig.CONNECTION_STRING, 2);
     }
 
     @Test
@@ -231,7 +245,6 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         assertNoConfigurationErrors(result, MongoDbConnectorConfig.SSL_ENABLED);
         assertNoConfigurationErrors(result, MongoDbConnectorConfig.SSL_ALLOW_INVALID_HOSTNAMES);
         assertNoConfigurationErrors(result, CommonConnectorConfig.TOMBSTONES_ON_DELETE);
-        assertNoConfigurationErrors(result, MongoDbConnectorConfig.CONNECTION_MODE);
         assertNoConfigurationErrors(result, MongoDbConnectorConfig.CAPTURE_MODE);
     }
 
@@ -328,7 +341,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -397,7 +410,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         insertAndUpdateAndReplace.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
         });
         SourceRecord insertRecord = insertAndUpdateAndReplace.allRecordsInOrder().get(0);
         verifyCreateOperation(insertRecord);
@@ -437,7 +450,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
 
         SourceRecord deleteRecord = delete.allRecordsInOrder().get(0);
         validate(deleteRecord);
-        verifyNotFromInitialSync(deleteRecord);
+        verifyNotFromInitialSnapshot(deleteRecord);
         verifyDeleteOperation(deleteRecord);
 
         Struct deleteValue = (Struct) deleteRecord.value();
@@ -455,12 +468,115 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
 
     @Test
     @SkipWhenDatabaseVersion(check = LESS_THAN, major = 6, reason = "Pre-image support in Change Stream is officially released in Mongo 6.0.")
+    public void shouldConsumeFullUpdateWithPostImage() throws InterruptedException {
+        shouldConsumeFullUpdate(FullUpdateType.POST_IMAGE, "updated", "final");
+    }
+
+    @Test
+    public void shouldConsumeFullUpdateWithLookup() throws InterruptedException {
+        shouldConsumeFullUpdate(FullUpdateType.LOOKUP, "updated", "final");
+    }
+
+    public void shouldConsumeFullUpdate(FullUpdateType fullUpdateType, String firstUpdate, String secondUpdate) throws InterruptedException {
+        config = TestHelper.getConfiguration(mongo).edit()
+                .with(MongoDbConnectorConfig.CAPTURE_MODE, MongoDbConnectorConfig.CaptureMode.CHANGE_STREAMS_UPDATE_FULL)
+                .with(MongoDbConnectorConfig.CAPTURE_MODE_FULL_UPDATE_TYPE, fullUpdateType)
+                .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .build();
+
+        // Set up the replication context for connections ...
+        context = new MongoDbTaskContext(config);
+
+        // Cleanup database
+        TestHelper.cleanDatabase(mongo, "dbit");
+
+        // Create database
+        String collName = "images";
+        try (var client = connect()) {
+            MongoDatabase db1 = client.getDatabase("dbit");
+            CreateCollectionOptions options = new CreateCollectionOptions();
+            if (fullUpdateType.isPostImage()) {
+                options.changeStreamPreAndPostImagesOptions(new ChangeStreamPreAndPostImagesOptions(true));
+            }
+            db1.createCollection(collName, options);
+        }
+
+        var doc = new Document("_id", "0").append("val", "init");
+        insertDocuments("dbit", collName, doc);
+
+        // Start the connector ...
+        start(MongoDbConnector.class, config);
+
+        // Consume initial event
+        SourceRecords records = consumeRecordsByTopic(1);
+        records.topics().forEach(System.out::println);
+        assertThat(records.recordsForTopic("mongo.dbit.images").size()).isEqualTo(1);
+        assertThat(records.topics().size()).isEqualTo(1);
+        AtomicBoolean foundLast = new AtomicBoolean(false);
+        records.forEach(record -> {
+            // Check that all records are valid, and can be serialized and deserialized ...
+            validate(record);
+            verifyFromInitialSnapshot(record, foundLast);
+            verifyReadOperation(record);
+        });
+        assertThat(foundLast.get()).isTrue();
+
+        // stop the connector
+        stopConnector();
+        Testing.Debug.enable();
+
+        // update the document twice
+        var selector = new Document("_id", "0");
+        var update1 = new Document("$set", new Document("val", firstUpdate));
+        var update2 = new Document("$set", new Document("val", secondUpdate));
+        updateDocument("dbit", collName, selector, update1);
+        updateDocument("dbit", collName, selector, update2);
+
+        // start the connector again
+        start(MongoDbConnector.class, config);
+
+        // Wait until we can consume the 2 updates
+        SourceRecords updateRecords = consumeRecordsByTopic(2);
+        assertThat(updateRecords.recordsForTopic("mongo.dbit.images").size()).isEqualTo(2);
+        assertThat(updateRecords.topics().size()).isEqualTo(1);
+        updateRecords.forEach(record -> {
+            // Check that all records are valid, and can be serialized and deserialized ...
+            validate(record);
+            verifyNotFromInitialSnapshot(record);
+        });
+
+        // Verify after values
+        SourceRecord updateRecord1 = updateRecords.allRecordsInOrder().get(0);
+        verifyUpdateOperation(updateRecord1);
+        SourceRecord updateRecord2 = updateRecords.allRecordsInOrder().get(1);
+        verifyUpdateOperation(updateRecord2);
+
+        Testing.debug("Update event 1: " + updateRecord1);
+        Testing.debug("Update event 2: " + updateRecord2);
+
+        Struct updateValue1 = (Struct) updateRecord1.value();
+        Struct updateValue2 = (Struct) updateRecord2.value();
+
+        if (fullUpdateType.isPostImage()) {
+            assertThat(updateValue1.getString("after")).contains(firstUpdate);
+            assertThat(updateValue2.getString("after")).contains(secondUpdate);
+        }
+        else {
+            assertThat(updateValue1.getString("after")).contains(secondUpdate);
+            assertThat(updateValue2.getString("after")).contains(secondUpdate);
+        }
+    }
+
+    @Test
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 6, reason = "Pre-image support in Change Stream is officially released in Mongo 6.0.")
     public void shouldConsumeLargeEvents() throws InterruptedException {
         final var collName = "large";
         final var dbName = "dbit";
 
         config = TestHelper.getConfiguration(mongo).edit()
-                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.NEVER)
+                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.NO_DATA)
                 .with(MongoDbConnectorConfig.CAPTURE_MODE, MongoDbConnectorConfig.CaptureMode.CHANGE_STREAMS_UPDATE_FULL_WITH_PRE_IMAGE)
                 .with(MongoDbConnectorConfig.CURSOR_OVERSIZE_HANDLING_MODE, MongoDbConnectorConfig.OversizeHandlingMode.SPLIT)
                 .with(MongoDbConnectorConfig.POLL_INTERVAL_MS, 10)
@@ -511,7 +627,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
 
         validate(updateRecord);
         verifyUpdateOperation(updateRecord);
-        verifyNotFromInitialSync(updateRecord);
+        verifyNotFromInitialSnapshot(updateRecord);
 
         Struct updateValue = (Struct) updateRecord.value();
         var actualBeforeDocument = Document.parse(updateValue.getString("before"));
@@ -557,7 +673,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -576,7 +692,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -602,7 +718,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records3.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -618,7 +734,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records4.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -666,7 +782,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records4.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
         SourceRecord insertRecord = insertAndUpdate.allRecordsInOrder().get(0);
@@ -697,7 +813,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
 
         SourceRecord deleteRecord = delete.allRecordsInOrder().get(0);
         validate(deleteRecord);
-        verifyNotFromInitialSync(deleteRecord);
+        verifyNotFromInitialSnapshot(deleteRecord);
         verifyDeleteOperation(deleteRecord);
 
         SourceRecord tombStoneRecord = delete.allRecordsInOrder().get(1);
@@ -913,7 +1029,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -932,13 +1048,36 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
         // ---------------------------------------------------------------------------------------------------------------
         // Stop the connector
         // ---------------------------------------------------------------------------------------------------------------
+        stopConnector();
+    }
+
+    @Test
+    @FixFor("DBZ-6434")
+    public void testMissingAuthenticationCredentials() {
+        final String authDbName = "authdb";
+
+        // Use the DB configuration to define the connector's configuration ...
+        config = TestHelper.getConfiguration(mongo).edit()
+                .with(MongoDbConnectorConfig.USER, "dbz")
+                .with(MongoDbConnectorConfig.AUTH_SOURCE, authDbName)
+                .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbit.*")
+                .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
+                .build();
+
+        // Set up the replication context for connections ...
+        context = new MongoDbTaskContext(config);
+
+        // Start the connector ...
+        start(MongoDbConnector.class, config);
+
+        assertConnectorNotRunning();
         stopConnector();
     }
 
@@ -990,7 +1129,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1011,7 +1150,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
         // ---------------------------------------------------------------------------------------------------------------
@@ -1078,7 +1217,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1099,7 +1238,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
         // ---------------------------------------------------------------------------------------------------------------
@@ -1144,7 +1283,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1165,7 +1304,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -1218,7 +1357,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1267,7 +1406,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         stopConnector(value -> assertThat(logInterceptor.containsWarnMessage(DatabaseSchema.NO_CAPTURED_DATA_COLLECTIONS_WARNING)).isTrue());
     }
 
-    protected void verifyFromInitialSync(SourceRecord record, AtomicBoolean foundLast) {
+    protected void verifyFromInitialSnapshot(SourceRecord record, AtomicBoolean foundLast) {
         if (record.sourceOffset().containsKey(SourceInfo.INITIAL_SYNC)) {
             assertThat(record.sourceOffset().containsKey(SourceInfo.INITIAL_SYNC)).isTrue();
             Struct value = (Struct) record.value();
@@ -1321,7 +1460,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1341,7 +1480,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -1368,7 +1507,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records3.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
     }
@@ -1417,7 +1556,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1438,7 +1577,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records2.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
 
@@ -1467,7 +1606,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records3.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyNotFromInitialSync(record);
+            verifyNotFromInitialSnapshot(record);
             verifyCreateOperation(record);
         });
     }
@@ -1504,7 +1643,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         records.forEach(record -> {
             // Check that all records are valid, and can be serialized and deserialized ...
             validate(record);
-            verifyFromInitialSync(record, foundLast);
+            verifyFromInitialSnapshot(record, foundLast);
             verifyReadOperation(record);
         });
         assertThat(foundLast.get()).isTrue();
@@ -1615,7 +1754,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         stopConnector();
     }
 
-    protected void verifyNotFromInitialSync(SourceRecord record) {
+    protected void verifyNotFromInitialSnapshot(SourceRecord record) {
         assertThat(record.sourceOffset().containsKey(SourceInfo.INITIAL_SYNC)).isFalse();
         Struct value = (Struct) record.value();
         assertThat(value.getStruct(Envelope.FieldName.SOURCE).getString(SourceInfo.SNAPSHOT_KEY)).isNull();
@@ -2349,7 +2488,7 @@ public class MongoDbConnectorIT extends AbstractMongoConnectorIT {
         config = TestHelper.getConfiguration(mongo).edit()
                 .with(MongoDbConnectorConfig.COLLECTION_INCLUDE_LIST, "dbA.contacts")
                 .with(CommonConnectorConfig.TOPIC_PREFIX, "mongo")
-                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.NEVER)
+                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, MongoDbConnectorConfig.SnapshotMode.NO_DATA)
                 .build();
 
         context = new MongoDbTaskContext(config);

@@ -548,6 +548,21 @@ partitionFunctionDefinition
       '(' uidList? ')'                                              #partitionFunctionKey // Optional uidList for MySQL only
     | RANGE ( '(' expression ')' | COLUMNS '(' uidList ')' )        #partitionFunctionRange
     | LIST ( '(' expression ')' | COLUMNS '(' uidList ')' )         #partitionFunctionList
+    | SYSTEM_TIME
+        ( expression | LIMIT expression )
+        ( STARTS ( TIMESTAMP timestampValue | timestampValue ) )?
+        AUTO?
+        partitionSystemVersionDefinitions?                          #partitionSystemVersion // MariaDB-specific
+    ;
+
+// MariaDB-specific
+partitionSystemVersionDefinitions
+    : '(' partitionSystemVersionDefinition (',' partitionSystemVersionDefinition)* ')'
+    ;
+
+// MariaDB-specific
+partitionSystemVersionDefinition
+    : PARTITION uid ( HISTORY | CURRENT )
     ;
 
 subpartitionFunctionDefinition
@@ -724,7 +739,7 @@ alterSpecification
         | SET (VISIBLE | INVISIBLE)
         | DROP DEFAULT)                                             #alterByAlterColumnDefault
     | ALTER INDEX uid (VISIBLE | INVISIBLE)                         #alterByAlterIndexVisibility
-    | DROP FOREIGN KEY ifExists? uid                                #alterByDropForeignKey // here ifExists is MariaDB-specific only
+    | DROP FOREIGN KEY ifExists? uid dottedId?                      #alterByDropForeignKey // here ifExists and dottedId is MariaDB-specific only
     | DISABLE KEYS                                                  #alterByDisableKeys
     | ENABLE KEYS                                                   #alterByEnableKeys
     | RENAME renameFormat=(TO | AS)? (uid | fullId)                 #alterByRename
@@ -1132,7 +1147,7 @@ querySpecification
 
 querySpecificationNointo
     : SELECT selectSpec* selectElements
-      fromClause? groupByClause? havingClause? windowClause? orderByClause? limitClause?
+      fromClause? groupByClause? havingClause? windowClause? orderByClause? limitClause? unionStatement?
     ;
 
 unionParenthesis

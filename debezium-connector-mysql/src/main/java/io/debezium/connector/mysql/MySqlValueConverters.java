@@ -5,6 +5,9 @@
  */
 package io.debezium.connector.mysql;
 
+import static io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode.FAIL;
+import static io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode.WARN;
+
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.ByteOrder;
@@ -41,6 +44,7 @@ import io.debezium.DebeziumException;
 import io.debezium.annotation.Immutable;
 import io.debezium.annotation.VisibleForTesting;
 import io.debezium.config.CommonConnectorConfig.BinaryHandlingMode;
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.config.Configuration;
 import io.debezium.connector.mysql.antlr.MySqlAntlrDdlParser;
 import io.debezium.connector.mysql.strategy.ConnectorAdapter;
@@ -52,6 +56,7 @@ import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.ValueConverter;
 import io.debezium.time.Year;
+import io.debezium.util.Loggings;
 import io.debezium.util.Strings;
 
 /**
@@ -70,11 +75,6 @@ import io.debezium.util.Strings;
  */
 @Immutable
 public class MySqlValueConverters extends JdbcValueConverters {
-
-    @FunctionalInterface
-    public interface ParsingErrorHandler {
-        void error(String message, Exception exception);
-    }
 
     private static final Logger LOGGER = LoggerFactory.getLogger(MySqlValueConverters.class);
 
@@ -117,8 +117,8 @@ public class MySqlValueConverters extends JdbcValueConverters {
         return temporal;
     }
 
-    private final ParsingErrorHandler parsingErrorHandler;
     private final ConnectorAdapter connectorAdapter;
+    private final EventConvertingFailureHandlingMode eventConvertingFailureHandlingMode;
 
     /**
      * Create a new instance that always uses UTC for the default time zone when_needed converting values without timezone information
@@ -135,7 +135,28 @@ public class MySqlValueConverters extends JdbcValueConverters {
     @VisibleForTesting
     public MySqlValueConverters(DecimalMode decimalMode, TemporalPrecisionMode temporalPrecisionMode, BigIntUnsignedMode bigIntUnsignedMode,
                                 BinaryHandlingMode binaryMode) {
-        this(decimalMode, temporalPrecisionMode, bigIntUnsignedMode, binaryMode, x -> x, MySqlValueConverters::defaultParsingErrorHandler, resolveDefaultAdapter());
+        this(decimalMode, temporalPrecisionMode, bigIntUnsignedMode, binaryMode, x -> x, resolveDefaultAdapter(), WARN);
+    }
+
+    /**
+     * Create a new instance that always uses UTC for the default time zone when converting values without timezone information
+     * to values that require timezones.
+     * <p>
+     *
+     * @param decimalMode how {@code DECIMAL} and {@code NUMERIC} values should be treated; may be null if
+     *            {@link io.debezium.jdbc.JdbcValueConverters.DecimalMode#PRECISE} is to be used
+     * @param temporalPrecisionMode temporal precision mode based on {@link io.debezium.jdbc.TemporalPrecisionMode}
+     * @param bigIntUnsignedMode how {@code BIGINT UNSIGNED} values should be treated; may be null if
+     *            {@link io.debezium.jdbc.JdbcValueConverters.BigIntUnsignedMode#PRECISE} is to be used
+     * @param binaryMode how binary columns should be represented
+     * @param adjuster a temporal adjuster to make a database specific time modification before conversion
+     * @param connectorAdapter the connector adapter
+     */
+    @VisibleForTesting
+    public MySqlValueConverters(DecimalMode decimalMode, TemporalPrecisionMode temporalPrecisionMode, BigIntUnsignedMode bigIntUnsignedMode,
+                                BinaryHandlingMode binaryMode,
+                                TemporalAdjuster adjuster, ConnectorAdapter connectorAdapter) {
+        this(decimalMode, temporalPrecisionMode, bigIntUnsignedMode, binaryMode, adjuster, connectorAdapter, WARN);
     }
 
     private static ConnectorAdapter resolveDefaultAdapter() {
@@ -157,13 +178,15 @@ public class MySqlValueConverters extends JdbcValueConverters {
      * @param binaryMode how binary columns should be represented
      * @param adjuster a temporal adjuster to make a database specific time modification before conversion
      * @param connectorAdapter the connector adapter
+     * @param eventConvertingFailureHandlingMode how handle when converting failure
      */
     public MySqlValueConverters(DecimalMode decimalMode, TemporalPrecisionMode temporalPrecisionMode, BigIntUnsignedMode bigIntUnsignedMode,
                                 BinaryHandlingMode binaryMode,
-                                TemporalAdjuster adjuster, ParsingErrorHandler parsingErrorHandler, ConnectorAdapter connectorAdapter) {
+                                TemporalAdjuster adjuster, ConnectorAdapter connectorAdapter,
+                                EventConvertingFailureHandlingMode eventConvertingFailureHandlingMode) {
         super(decimalMode, temporalPrecisionMode, ZoneOffset.UTC, adjuster, bigIntUnsignedMode, binaryMode);
-        this.parsingErrorHandler = parsingErrorHandler;
         this.connectorAdapter = connectorAdapter;
+        this.eventConvertingFailureHandlingMode = eventConvertingFailureHandlingMode;
     }
 
     @Override
@@ -332,6 +355,15 @@ public class MySqlValueConverters extends JdbcValueConverters {
         return super.converter(column, fieldDefn);
     }
 
+    @Override
+    protected Object handleUnknownData(Column column, Field fieldDefn, Object data) {
+        Class<?> dataClass = data.getClass();
+        String clazzName = dataClass.isArray() ? dataClass.getSimpleName() : dataClass.getName();
+        // exception will be handled in TableSchemaBuilder.createValueGenerator
+        throw new IllegalArgumentException("Unexpected value for JDBC type " + column.jdbcType() + " and column " + column +
+                ": class=" + clazzName);
+    }
+
     /**
      * Return the {@link Charset} instance with the MySQL-specific character set name used by the given column.
      *
@@ -386,7 +418,13 @@ public class MySqlValueConverters extends JdbcValueConverters {
                         r.deliver(JsonBinary.parseAsString((byte[]) data));
                     }
                     catch (IOException e) {
-                        parsingErrorHandler.error("Failed to parse and read a JSON value on '" + column + "' value " + Arrays.toString((byte[]) data), e);
+                        if (eventConvertingFailureHandlingMode == FAIL) {
+                            Loggings.logErrorAndTraceRecord(logger, Arrays.toString((byte[]) data),
+                                    "Failed to parse and read a JSON value on '{}'", column, e);
+                            throw new DebeziumException("Failed to parse and read a JSON value on '" + column + "'", e);
+                        }
+                        Loggings.logWarningAndTraceRecord(logger, Arrays.toString((byte[]) data),
+                                "Failed to parse and read a JSON value on '{}'", column, e);
                         r.deliver(column.isOptional() ? null : "{}");
                     }
                 }
@@ -922,9 +960,5 @@ public class MySqlValueConverters extends JdbcValueConverters {
             return true;
         }
         return false;
-    }
-
-    public static void defaultParsingErrorHandler(String message, Exception exception) {
-        throw new DebeziumException(message, exception);
     }
 }

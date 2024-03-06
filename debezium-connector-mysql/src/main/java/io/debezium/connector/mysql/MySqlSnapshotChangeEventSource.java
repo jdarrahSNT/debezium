@@ -53,6 +53,8 @@ import io.debezium.relational.RelationalTableFilters;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
+import io.debezium.snapshot.SnapshotterService;
+import io.debezium.spi.snapshot.Snapshotter;
 import io.debezium.util.Clock;
 import io.debezium.util.Collect;
 import io.debezium.util.Strings;
@@ -78,8 +80,9 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
                                           MySqlSnapshotChangeEventSourceMetrics metrics,
                                           BlockingConsumer<Function<SourceRecord, SourceRecord>> lastEventProcessor,
                                           Runnable preSnapshotAction,
-                                          NotificationService<MySqlPartition, MySqlOffsetContext> notificationService) {
-        super(connectorConfig, connectionFactory, schema, dispatcher, clock, metrics, notificationService);
+                                          NotificationService<MySqlPartition, MySqlOffsetContext> notificationService, SnapshotterService snapshotterService) {
+
+        super(connectorConfig, connectionFactory, schema, dispatcher, clock, metrics, notificationService, snapshotterService);
         this.connectorConfig = connectorConfig;
         this.connection = connectionFactory.mainConnection();
         this.filters = connectorConfig.getTableFilters();
@@ -92,33 +95,43 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
     @Override
     public SnapshottingTask getSnapshottingTask(MySqlPartition partition, MySqlOffsetContext previousOffset) {
 
+        // TODO DBZ-7308 evaluate getSnapshottingTask can be shared
+
+        final Snapshotter snapshotter = snapshotterService.getSnapshotter();
+
         List<String> dataCollectionsToBeSnapshotted = connectorConfig.getDataCollectionsToBeSnapshotted();
         Map<String, String> snapshotSelectOverridesByTable = connectorConfig.getSnapshotSelectOverridesByTable().entrySet().stream()
                 .collect(Collectors.toMap(e -> e.getKey().identifier(), Map.Entry::getValue));
 
-        // found a previous offset and the earlier snapshot has completed
-        if (previousOffset != null && !previousOffset.isSnapshotRunning()) {
+        boolean offsetExists = previousOffset != null;
+        boolean snapshotInProgress = false;
 
-            LOGGER.info("A previous offset indicating a completed snapshot has been found. Neither schema nor data will be snapshotted.");
-            return new SnapshottingTask(databaseSchema.isStorageInitializationExecuted(), false, dataCollectionsToBeSnapshotted, snapshotSelectOverridesByTable, false);
+        if (offsetExists) {
+            snapshotInProgress = previousOffset.isSnapshotRunning();
         }
 
-        LOGGER.info("No previous offset has been found");
-        if (this.connectorConfig.getSnapshotMode().includeData()) {
+        if (offsetExists && !previousOffset.isSnapshotRunning()) {
+            LOGGER.info("A previous offset indicating a completed snapshot has been found. Neither schema nor data will be snapshotted.");
+        }
+
+        boolean shouldSnapshotSchema = snapshotter.shouldSnapshotSchema(offsetExists, snapshotInProgress);
+        boolean shouldSnapshotData = snapshotter.shouldSnapshotData(offsetExists, snapshotInProgress);
+
+        if (shouldSnapshotSchema && shouldSnapshotData) {
             LOGGER.info("According to the connector configuration both schema and data will be snapshotted");
         }
         else {
             LOGGER.info("According to the connector configuration only schema will be snapshotted");
         }
 
-        return new SnapshottingTask(this.connectorConfig.getSnapshotMode().includeSchema(), this.connectorConfig.getSnapshotMode().includeData(),
+        return new SnapshottingTask(shouldSnapshotSchema, shouldSnapshotData,
                 dataCollectionsToBeSnapshotted,
                 snapshotSelectOverridesByTable, false);
     }
 
     @Override
-    protected SnapshotContext<MySqlPartition, MySqlOffsetContext> prepare(MySqlPartition partition) throws Exception {
-        return new MySqlSnapshotContext(partition);
+    protected SnapshotContext<MySqlPartition, MySqlOffsetContext> prepare(MySqlPartition partition, boolean onDemand) {
+        return new MySqlSnapshotContext(partition, onDemand);
     }
 
     @Override
@@ -212,6 +225,7 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
     @Override
     protected void releaseSchemaSnapshotLocks(RelationalSnapshotContext<MySqlPartition, MySqlOffsetContext> snapshotContext)
             throws SQLException {
+
         if (connectorConfig.getSnapshotLockingMode().usesMinimalLocking()) {
             if (isGloballyLocked()) {
                 globalUnlock();
@@ -290,7 +304,7 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
         ctx.offset = offsetContext;
 
         connectorConfig.getConnectorAdapter()
-                .setOffsetContextBinlogPositionAndGtidDetailsForSnapshot(offsetContext, connection);
+                .setOffsetContextBinlogPositionAndGtidDetailsForSnapshot(offsetContext, connection, snapshotterService);
 
         tryStartingSnapshot(ctx);
     }
@@ -333,7 +347,7 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
                 .collect(Collectors.groupingBy(TableId::catalog, LinkedHashMap::new, Collectors.toList()));
         final Set<String> databases = tablesToRead.keySet();
 
-        if (!snapshottingTask.isBlocking()) {
+        if (!snapshottingTask.isOnDemand()) {
             // Record default charset
             addSchemaEvent(snapshotContext, "", connection.setStatementFor(connection.readCharsetSystemVariables()));
         }
@@ -359,7 +373,7 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
                     throw new InterruptedException("Interrupted while reading structure of schema " + databases);
                 }
 
-                if (!snapshottingTask.isBlocking()) {
+                if (!snapshottingTask.isOnDemand()) {
                     // in case of blocking snapshot we want to read structures only for collections specified in the signal
                     LOGGER.info("Reading structure of database '{}'", database);
                     addSchemaEvent(snapshotContext, database, "DROP DATABASE IF EXISTS " + quote(database));
@@ -470,17 +484,20 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
     @Override
     protected Optional<String> getSnapshotSelect(RelationalSnapshotContext<MySqlPartition, MySqlOffsetContext> snapshotContext,
                                                  TableId tableId, List<String> columns) {
-        return Optional.of(getSnapshotSelect(tableId, columns));
+        return getSnapshotSelect(tableId, columns);
     }
 
-    private String getSnapshotSelect(TableId tableId, List<String> columns) {
-        String snapshotSelectColumns = String.join(", ", columns);
-        return String.format("SELECT %s FROM `%s`.`%s`", snapshotSelectColumns, tableId.catalog(), tableId.table());
+    private Optional<String> getSnapshotSelect(TableId tableId, List<String> columns) {
+
+        return snapshotterService.getSnapshotQuery().snapshotQuery(tableId.toQuotedString('`'), columns);
     }
 
     @Override
     protected Optional<String> getSnapshotConnectionFirstSelect(RelationalSnapshotContext<MySqlPartition, MySqlOffsetContext> snapshotContext, TableId tableId) {
-        return Optional.of(getSnapshotSelect(tableId, List.of("*")) + " LIMIT 1");
+        if (getSnapshotSelect(tableId, List.of("*")).isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(getSnapshotSelect(tableId, List.of("*")).get() + " LIMIT 1");
     }
 
     private boolean isGloballyLocked() {
@@ -493,8 +510,11 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
 
     private void globalLock() throws SQLException {
         LOGGER.info("Flush and obtain global read lock to prevent writes to database");
-        connection.executeWithoutCommitting(connectorConfig.getSnapshotLockingMode().getLockStatement());
-        globalLockAcquiredAt = clock.currentTimeInMillis();
+        Optional<String> lockingStatement = snapshotterService.getSnapshotLock().tableLockingStatement(null, Set.of());
+        if (lockingStatement.isPresent()) {
+            connection.executeWithoutCommitting(lockingStatement.get());
+            globalLockAcquiredAt = clock.currentTimeInMillis();
+        }
     }
 
     private void globalUnlock() throws SQLException {
@@ -598,8 +618,8 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
      */
     private static class MySqlSnapshotContext extends RelationalSnapshotContext<MySqlPartition, MySqlOffsetContext> {
 
-        MySqlSnapshotContext(MySqlPartition partition) throws SQLException {
-            super(partition, "");
+        MySqlSnapshotContext(MySqlPartition partition, boolean onDemand) {
+            super(partition, "", onDemand);
         }
     }
 
@@ -622,7 +642,7 @@ public class MySqlSnapshotChangeEventSource extends RelationalSnapshotChangeEven
             LOGGER.debug("Processing schema event {}", event);
 
             final TableId tableId = event.getTables().isEmpty() ? null : event.getTables().iterator().next().id();
-            if (snapshottingTask.isBlocking() && !snapshotContext.capturedTables.contains(tableId)) {
+            if (snapshottingTask.isOnDemand() && !snapshotContext.capturedTables.contains(tableId)) {
                 LOGGER.debug("Event {} will be skipped since it's not related to blocking snapshot captured table {}", event, snapshotContext.capturedTables);
                 continue;
             }

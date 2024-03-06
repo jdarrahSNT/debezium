@@ -12,11 +12,14 @@ import java.sql.SQLRecoverableException;
 import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -26,10 +29,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Field;
 import io.debezium.connector.oracle.OracleConnectorConfig.ConnectorAdapter;
+import io.debezium.connector.oracle.logminer.SqlUtils;
 import io.debezium.jdbc.JdbcConfiguration;
 import io.debezium.jdbc.JdbcConnection;
+import io.debezium.pipeline.spi.OffsetContext;
+import io.debezium.relational.Attribute;
 import io.debezium.relational.Column;
 import io.debezium.relational.ColumnEditor;
 import io.debezium.relational.TableId;
@@ -38,6 +45,7 @@ import io.debezium.relational.Tables.ColumnNameFilter;
 import io.debezium.util.Strings;
 
 import oracle.jdbc.OracleTypes;
+import oracle.sql.CharacterSet;
 
 public class OracleConnection extends JdbcConnection {
 
@@ -85,6 +93,8 @@ public class OracleConnection extends JdbcConnection {
 
     public OracleConnection(JdbcConfiguration config, ConnectionFactory connectionFactory, boolean showVersion) {
         super(config, connectionFactory, QUOTED_CHARACTER, QUOTED_CHARACTER);
+        LOGGER.trace("JDBC connection string: " + connectionString(config));
+        this.logPositionValidator = this::validateLogPosition;
         this.databaseVersion = resolveOracleDatabaseVersion();
         if (showVersion) {
             LOGGER.info("Database Version: {}", databaseVersion.getBanner());
@@ -93,6 +103,8 @@ public class OracleConnection extends JdbcConnection {
 
     public OracleConnection(JdbcConfiguration config, boolean showVersion) {
         super(config, resolveConnectionFactory(config), QUOTED_CHARACTER, QUOTED_CHARACTER);
+        LOGGER.trace("JDBC connection string: " + connectionString(config));
+        this.logPositionValidator = this::validateLogPosition;
         this.databaseVersion = resolveOracleDatabaseVersion();
         if (showVersion) {
             LOGGER.info("Database Version: {}", databaseVersion.getBanner());
@@ -384,6 +396,47 @@ public class OracleConnection extends JdbcConnection {
         return queryAndMap(query, rs -> rs.next() ? extractor.apply(rs) : null);
     }
 
+    /**
+     * Gets the first system change number in both archive and redo logs.
+     *
+     * @param archiveLogRetention retention of the archive log
+     * @param archiveDestinationName name of the archive log destination to be used for reading archive logs
+     * @return the oldest system change number
+     * @throws SQLException      if a database exception occurred
+     * @throws DebeziumException if the oldest system change number cannot be found due to no logs available
+     */
+    public Optional<Scn> getFirstScnInLogs(Duration archiveLogRetention, String archiveDestinationName) throws SQLException {
+
+        final String oldestFirstChangeQuery = SqlUtils.oldestFirstChangeQuery(archiveLogRetention, archiveDestinationName);
+        final String oldestScn = singleOptionalValue(oldestFirstChangeQuery, rs -> rs.getString(1));
+
+        if (oldestScn == null) {
+            return Optional.empty();
+        }
+
+        LOGGER.trace("Oldest SCN in logs is '{}'", oldestScn);
+        return Optional.of(Scn.valueOf(oldestScn));
+    }
+
+    public boolean validateLogPosition(OffsetContext offset, CommonConnectorConfig config) {
+
+        final Duration archiveLogRetention = ((OracleConnectorConfig) config).getArchiveLogRetention();
+        final String archiveDestinationName = ((OracleConnectorConfig) config).getArchiveLogDestinationName();
+        final Scn storedOffset = ((OracleConnectorConfig) config).getAdapter().getOffsetScn((OracleOffsetContext) offset);
+
+        try {
+            Optional<Scn> firstAvailableScn = getFirstScnInLogs(archiveLogRetention, archiveDestinationName);
+            return firstAvailableScn.filter(isLessThan(storedOffset)).isPresent();
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Unable to get last available log position", e);
+        }
+    }
+
+    private static Predicate<Scn> isLessThan(Scn storedOffset) {
+        return scn -> scn.compareTo(storedOffset) < 0;
+    }
+
     @Override
     public String buildSelectWithRowLimits(TableId tableId,
                                            int limit,
@@ -570,23 +623,70 @@ public class OracleConnection extends JdbcConnection {
     }
 
     @Override
-    public String buildReselectColumnQuery(TableId tableId, List<String> columns, List<String> keyColumns, Struct source) {
-        final String commitScn = source.getString(SourceInfo.COMMIT_SCN_KEY);
-        final TableId oracleTableId = new TableId(null, tableId.schema(), tableId.table());
-        if (Strings.isNullOrEmpty(commitScn)) {
-            return super.buildReselectColumnQuery(oracleTableId, columns, keyColumns, source);
-        }
-
-        return String.format("SELECT %s FROM (SELECT * FROM %s AS OF SCN %s) WHERE %s",
-                columns.stream().map(this::quotedColumnIdString).collect(Collectors.joining(",")),
-                quotedTableIdString(oracleTableId),
-                commitScn,
-                keyColumns.stream().map(key -> key + "=?").collect(Collectors.joining(" AND ")));
+    public Optional<Boolean> nullsSortLast() {
+        // "NULLS LAST is the default for ascending order"
+        // https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/SELECT.html
+        return Optional.of(true);
     }
 
     @Override
-    public Map<String, Object> reselectColumns(String query, TableId tableId, List<String> columns, List<Object> bindValues) throws SQLException {
-        return optionallyDoInContainer(() -> super.reselectColumns(query, tableId, columns, bindValues));
+    public Map<String, Object> reselectColumns(TableId tableId, List<String> columns, List<String> keyColumns, List<Object> keyValues, Struct source)
+            throws SQLException {
+        final TableId oracleTableId = new TableId(null, tableId.schema(), tableId.table());
+        final String commitScn = source.getString(SourceInfo.COMMIT_SCN_KEY);
+        if (Strings.isNullOrEmpty(commitScn)) {
+            return optionallyDoInContainer(() -> super.reselectColumns(oracleTableId, columns, keyColumns, keyValues, source));
+        }
+
+        final String query = String.format("SELECT %s FROM (SELECT * FROM %s AS OF SCN ?) WHERE %s",
+                columns.stream().map(this::quotedColumnIdString).collect(Collectors.joining(",")),
+                quotedTableIdString(oracleTableId),
+                keyColumns.stream().map(key -> key + "=?").collect(Collectors.joining(" AND ")));
+        final List<Object> bindValues = new ArrayList<>(keyValues.size() + 1);
+        bindValues.add(commitScn);
+        bindValues.addAll(keyValues);
+        return optionallyDoInContainer(() -> {
+            try {
+                return reselectColumns(query, oracleTableId, columns, bindValues);
+            }
+            catch (SQLException e) {
+                if (e.getErrorCode() == 1555 || e.getMessage().startsWith("ORA-01555")) {
+                    LOGGER.warn("Failed to re-select row for table {} and key columns {} with values {}. " +
+                            "Trying to perform re-selection without flashback.", tableId, keyColumns, keyValues);
+                    return super.reselectColumns(oracleTableId, columns, keyColumns, keyValues, source);
+                }
+                throw e;
+            }
+        });
+    }
+
+    @Override
+    protected Map<TableId, List<Attribute>> getAttributeDetails(TableId tableId, String tableType) {
+        final Map<TableId, List<Attribute>> results = new HashMap<>();
+        try {
+            getDatabaseObjectDetails(tableId, tableType, (objectId, dataObjectId) -> {
+                LOGGER.info("\tRegistering '{}' attributes: object_id={}, data_object_id={}", tableId, objectId, dataObjectId);
+                final List<Attribute> attributes = new ArrayList<>();
+                attributes.add(Attribute.editor().name("OBJECT_ID").value(objectId).create());
+                attributes.add(Attribute.editor().name("DATA_OBJECT_ID").value(dataObjectId).create());
+                results.put(tableId, attributes);
+            });
+            return results;
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Failed to get table attributes for table: " + tableId, e);
+        }
+    }
+
+    @SuppressWarnings("resource")
+    private void getDatabaseObjectDetails(TableId tableId, String tableType, ObjectIdentifierConsumer consumer) throws SQLException {
+        final String query = "SELECT OBJECT_ID, DATA_OBJECT_ID FROM ALL_OBJECTS WHERE OBJECT_NAME=? AND OWNER=? AND OBJECT_TYPE=?";
+        prepareQuery(query, List.of(tableId.table(), tableId.schema(), tableType), (params, rs) -> {
+            if (!rs.next()) {
+                throw new SQLException("Query '" + query + "' returned no results.");
+            }
+            consumer.apply(rs.getLong(1), rs.getLong(2));
+        });
     }
 
     private <T> T optionallyDoInContainer(ContainerWork<T> work) throws SQLException {
@@ -606,9 +706,67 @@ public class OracleConnection extends JdbcConnection {
         }
     }
 
+    public Long getTableObjectId(TableId tableId) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT OBJECT_ID FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OWNER=? AND OBJECT_NAME=?",
+                ps -> {
+                    ps.setString(1, tableId.schema());
+                    ps.setString(2, tableId.table());
+                }, rs -> rs.next() ? rs.getLong(1) : null);
+    }
+
+    public Long getTableDataObjectId(TableId tableId) throws SQLException {
+        return prepareQueryAndMap(
+                "SELECT DATA_OBJECT_ID FROM ALL_OBJECTS WHERE OBJECT_TYPE='TABLE' AND OWNER=? AND OBJECT_NAME=?",
+                ps -> {
+                    ps.setString(1, tableId.schema());
+                    ps.setString(2, tableId.table());
+                }, rs -> rs.next() ? rs.getLong(1) : null);
+    }
+
+    /**
+     * Get the nationalized character set used for {@code NVARCHAR} and {@code NCHAR} data types.
+     *
+     * This method will lazily fetch the nationalized character set once per runtime. This is because
+     * the nationalized character set must be set only at database creation, and therefore it is fine to
+     * lazily query this when needed the first time and cache the value.
+     *
+     * <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/Data-Types.html#GUID-FE15E51B-52C6-45D7-9883-4DF47716A17D">NCHAR</a>
+     * <a href="https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/Data-Types.html#GUID-CC15FC97-BE94-4FA4-994A-6DDF7F1A9904">NVARCHAR2</a>
+     *
+     * @return the character set, can only be {@code AL16UTF16} or {@code UTF8}.
+     */
+    public CharacterSet getNationalCharacterSet() {
+        final String query = "select VALUE from NLS_DATABASE_PARAMETERS where PARAMETER = 'NLS_NCHAR_CHARACTERSET'";
+        try {
+            final String nlsCharacterSet = queryAndMap(query, rs -> {
+                if (rs.next()) {
+                    return rs.getString(1);
+                }
+                return null;
+            });
+            if (nlsCharacterSet != null) {
+                switch (nlsCharacterSet) {
+                    case "AL16UTF16":
+                        return CharacterSet.make(CharacterSet.AL16UTF16_CHARSET);
+                    case "UTF8":
+                        return CharacterSet.make(CharacterSet.UTF8_CHARSET);
+                }
+            }
+            throw new SQLException("An unexpected NLS_NCHAR_CHARACTERSET detected: " + nlsCharacterSet);
+        }
+        catch (SQLException e) {
+            throw new DebeziumException("Failed to resolve Oracle's NLS_NCHAR_CHARACTERSET property", e);
+        }
+    }
+
     @FunctionalInterface
     interface ContainerWork<T> {
         T execute() throws SQLException;
     }
 
+    @FunctionalInterface
+    interface ObjectIdentifierConsumer {
+        void apply(Long objectId, Long dataObjectId);
+    }
 }

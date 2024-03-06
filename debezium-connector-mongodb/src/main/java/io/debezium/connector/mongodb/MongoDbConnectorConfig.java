@@ -5,10 +5,13 @@
  */
 package io.debezium.connector.mongodb;
 
+import static java.util.function.Predicate.not;
+
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Pattern;
 
@@ -31,9 +34,8 @@ import io.debezium.config.Field;
 import io.debezium.config.Field.ValidationOutput;
 import io.debezium.connector.AbstractSourceInfo;
 import io.debezium.connector.SourceInfoStructMaker;
-import io.debezium.connector.mongodb.connection.ConnectionStrings;
 import io.debezium.connector.mongodb.connection.DefaultMongoDbAuthProvider;
-import io.debezium.connector.mongodb.connection.ReplicaSet;
+import io.debezium.connector.mongodb.connection.MongoDbAuthProvider;
 import io.debezium.data.Envelope;
 import io.debezium.schema.DefaultTopicNamingStrategy;
 import io.debezium.spi.schema.DataCollectionId;
@@ -57,7 +59,8 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     protected static final Pattern FIELD_RENAMES_PATTERN = Pattern
             .compile("^[*|\\w|\\-|\\s*]+(?:\\.[*|\\w|\\-]+\\.[*|\\w|\\-]+)+(\\.[*|\\w|\\-]+)*:(?:[*|\\w|\\-]+)+\\s*$");
     protected static final String QUALIFIED_FIELD_RENAMES_PATTERN = "<databaseName>.<collectionName>.<fieldName>.<nestedFieldName>:<newNestedFieldName>";
-    private final String shardConnectionParameters;
+
+    public static final String ADMIN_DATABASE_NAME = "admin";
 
     /**
      * The set of predefined SnapshotMode options or aliases.
@@ -71,8 +74,14 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
 
         /**
          * Never perform a snapshot and only receive new data changes.
+         * @deprecated to be removed in Debezium 3.0, replaced by {{@link #NO_DATA}}
          */
-        NEVER("never", false);
+        NEVER("never", false),
+
+        /**
+         * Never perform a snapshot and only receive new data changes.
+         */
+        NO_DATA("no_data", false);
 
         private final String value;
         private final boolean includeData;
@@ -127,7 +136,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     }
 
     /**
-     * The set off different ways how connector can capture changes.
+     * The set of different ways how connector can capture changes.
      */
     public enum CaptureMode implements EnumeratedValue {
 
@@ -220,6 +229,77 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     }
 
     /**
+     * The set off different ways how connector performs full update
+     */
+    public enum FullUpdateType implements EnumeratedValue {
+
+        /**
+         * Full update is performed via separate document lookup call
+         */
+        LOOKUP("lookup", false),
+
+        /**
+         * Full update utilises MongoDB post images
+         */
+        POST_IMAGE("post_image", true);
+
+        private final String value;
+        private final boolean postImage;
+
+        FullUpdateType(String value, boolean postImage) {
+            this.value = value;
+            this.postImage = postImage;
+        }
+
+        @Override
+        public String getValue() {
+            return value;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @return the matching option, or null if no match is found
+         */
+        public static FullUpdateType parse(String value) {
+            if (value == null) {
+                return null;
+            }
+            value = value.trim();
+
+            for (FullUpdateType option : FullUpdateType.values()) {
+                if (option.getValue().equalsIgnoreCase(value)) {
+                    return option;
+                }
+            }
+
+            return null;
+        }
+
+        /**
+         * Determine if the supplied value is one of the predefined options.
+         *
+         * @param value the configuration property value; may not be null
+         * @param defaultValue the default value; may be null
+         * @return the matching option, or null if no match is found and the non-null default is invalid
+         */
+        public static FullUpdateType parse(String value, String defaultValue) {
+            FullUpdateType type = parse(value);
+
+            if (type == null && defaultValue != null) {
+                type = parse(defaultValue);
+            }
+
+            return type;
+        }
+
+        public boolean isPostImage() {
+            return postImage;
+        }
+    }
+
+    /**
      * The set of predefined CaptureScope options or aliases.
      */
     public enum CaptureScope implements EnumeratedValue {
@@ -289,70 +369,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
          */
         public static CaptureScope parse(String value, String defaultValue) {
             CaptureScope mode = parse(value);
-
-            if (mode == null && defaultValue != null) {
-                mode = parse(defaultValue);
-            }
-
-            return mode;
-        }
-    }
-
-    /**
-     * The set of predefined MongoDbConnectionMode options or aliases.
-     */
-    public enum ConnectionMode implements EnumeratedValue {
-        /**
-         * Connect individually to each replica set
-         */
-        REPLICA_SET("replica_set"),
-
-        /**
-         * Connect to sharded cluster with single connection via mongos
-         */
-        SHARDED("sharded");
-
-        private String value;
-
-        ConnectionMode(String value) {
-            this.value = value;
-        }
-
-        @Override
-        public String getValue() {
-            return value;
-        }
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @return the matching option, or null if no match is found
-         */
-        public static ConnectionMode parse(String value) {
-            if (value == null) {
-                return null;
-            }
-            value = value.trim();
-
-            for (ConnectionMode option : ConnectionMode.values()) {
-                if (option.getValue().equalsIgnoreCase(value)) {
-                    return option;
-                }
-            }
-
-            return null;
-        }
-
-        /**
-         * Determine if the supplied value is one of the predefined options.
-         *
-         * @param value the configuration property value; may not be null
-         * @param defaultValue the default value; may be null
-         * @return the matching option, or null if no match is found and the non-null default is invalid
-         */
-        public static ConnectionMode parse(String value, String defaultValue) {
-            ConnectionMode mode = parse(value);
 
             if (mode == null && defaultValue != null) {
                 mode = parse(defaultValue);
@@ -566,16 +582,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
 
     protected static final int DEFAULT_SNAPSHOT_FETCH_SIZE = 0;
 
-    /**
-     * The {@link ReplicaSets#SEPARATOR}-separated list of connection strings
-     */
-    public static final Field TASK_CONNECTION_STRINGS = Field.createInternal("mongodb.internal.task.connection.strings")
-            .withDescription("Internal use only")
-            .withType(Type.LIST);
-
-    /**
-     * The {@link ReplicaSets#SEPARATOR}-separated list of connection strings
-     */
     public static final Field ALLOW_OFFSET_INVALIDATION = Field.createInternal("mongodb.allow.offset.invalidation")
             .withDescription("Allows offset invalidation when required by change of connection mode")
             .withDefault(false)
@@ -590,26 +596,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
             .withImportance(Importance.HIGH)
             .withValidation(MongoDbConnectorConfig::validateConnectionString)
             .withDescription("Database connection string.");
-
-    public static final Field SHARD_CONNECTION_PARAMS = Field.create("mongodb.connection.string.shard.params")
-            .withDisplayName("Shard connection parameters")
-            .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 6))
-            .withWidth(Width.MEDIUM)
-            .withImportance(Importance.MEDIUM)
-            .withDescription("The connection string parameters used when connecting to individual shards of sharded cluster."
-                    + "Only applicable with replica_set connection mode.");
-
-    public static final Field CONNECTION_MODE = Field.create("mongodb.connection.mode")
-            .withDisplayName("Connection mode")
-            .withEnum(ConnectionMode.class, ConnectionMode.SHARDED)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION, 2))
-            .withWidth(Width.SHORT)
-            .withImportance(Importance.HIGH)
-            .withDescription("The method used to connect to MongoDB cluster. "
-                    + "Options include: "
-                    + "'replica_set' to individually connect to each replica set / shard "
-                    + "'sharded' (the default) to connect via single connection obtained from connection string");
 
     public static final Field USER = Field.create("mongodb.user")
             .withDisplayName("User")
@@ -657,6 +643,61 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
             .withValidation(Field::isBoolean)
             .withDescription("Whether invalid host names are allowed when using SSL. If true the connection will not prevent man-in-the-middle attacks");
 
+    public static final Field SSL_KEYSTORE = Field.create("mongodb.ssl.keystore")
+            .withDisplayName("SSL Keystore")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 1))
+            .withWidth(Width.LONG)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The location of the key store file. "
+                    + "This is optional and can be used for two-way authentication between the client and the MySQL Server.");
+
+    public static final Field SSL_KEYSTORE_PASSWORD = Field.create("mongodb.ssl.keystore.password")
+            .withDisplayName("SSL Keystore Password")
+            .withType(Type.PASSWORD)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 2))
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The password for the key store file. "
+                    + "This is optional and only needed if 'mongodb.ssl.keystore' is configured.");
+
+    public static final Field SSL_KEYSTORE_TYPE = Field.create("mongodb.ssl.keystore.type")
+            .withDisplayName("SSL Keystore Type")
+            .withType(Type.STRING)
+            .withDefault("PKCS12")
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 3))
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The type of key store file. "
+                    + "This is optional and only needed if 'mongodb.ssl.keystore' is configured.");
+
+    public static final Field SSL_TRUSTSTORE = Field.create("mongodb.ssl.truststore")
+            .withDisplayName("SSL Truststore")
+            .withType(Type.STRING)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 4))
+            .withWidth(Width.LONG)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The location of the trust store file for the server certificate verification.");
+
+    public static final Field SSL_TRUSTSTORE_PASSWORD = Field.create("mongodb.ssl.truststore.password")
+            .withDisplayName("SSL Truststore Password")
+            .withType(Type.PASSWORD)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 5))
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The password for the trust store file. "
+                    + "Used to check the integrity of the truststore, and unlock the truststore.");
+
+    public static final Field SSL_TRUSTSTORE_TYPE = Field.create("mongodb.ssl.truststore.type")
+            .withDisplayName("SSL Keystore Type")
+            .withType(Type.STRING)
+            .withDefault("PKCS12")
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED_SSL, 6))
+            .withWidth(Width.MEDIUM)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The type of key store file. "
+                    + "This is optional and only needed if 'mongodb.ssl.truststore' is configured.");
+
     public static final Field CONNECT_TIMEOUT_MS = Field.create("mongodb.connect.timeout.ms")
             .withDisplayName("Connect Timeout MS")
             .withType(Type.INT)
@@ -672,7 +713,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
             .withGroup(Field.createGroupEntry(Field.Group.CONNECTION_ADVANCED, 1))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
-            .withDefault(ReplicaSetDiscovery.ADMIN_DATABASE_NAME)
+            .withDefault(ADMIN_DATABASE_NAME)
             .withDescription("Database containing user credentials.");
 
     public static final Field SERVER_SELECTION_TIMEOUT_MS = Field.create("mongodb.server.selection.timeout.ms")
@@ -820,10 +861,21 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
                     + "'change_streams' to capture changes via MongoDB Change Streams, update events do not contain full documents; "
                     + "'change_streams_update_full' (the default) to capture changes via MongoDB Change Streams, update events contain full documents");
 
+    public static final Field CAPTURE_MODE_FULL_UPDATE_TYPE = Field.create("capture.mode.full.update.type")
+            .withDisplayName("Capture mode full update type")
+            .withEnum(FullUpdateType.class, FullUpdateType.LOOKUP)
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 2))
+            .withWidth(Width.SHORT)
+            .withImportance(Importance.MEDIUM)
+            .withDescription("The method used to perform full update lookups. "
+                    + "Options include: "
+                    + "'lookup' (the default) use separate lookup to get the updated document; "
+                    + "'post_image' use MongoDB post images (requires Mongo 6.0 or newer");
+
     public static final Field CAPTURE_SCOPE = Field.create("capture.scope")
             .withDisplayName("Capture scope")
             .withEnum(CaptureScope.class, CaptureScope.DEPLOYMENT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 2))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 3))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The scope of captured changes. "
@@ -835,13 +887,14 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
             .withDisplayName("Capture target")
             .withType(Type.STRING)
             .withValidation(MongoDbConnectorConfig::validateCaptureTarget)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 3))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 4))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("Name of captured database for " + CAPTURE_SCOPE.name() + "=" + CaptureScope.DATABASE.value);
 
     protected static final Field TASK_ID = Field.create("mongodb.task.id")
             .withDescription("Internal use only")
+            .withDefault(0)
             .withValidation(Field::isInteger)
             .withInvisibleRecommender();
 
@@ -876,7 +929,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public static final Field CURSOR_PIPELINE = Field.create("cursor.pipeline")
             .withDisplayName("Pipeline stages applied to the change stream cursor")
             .withType(Type.STRING)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 4))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 5))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withValidation(MongoDbConnectorConfig::validateChangeStreamPipeline)
@@ -888,7 +941,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public static final Field CURSOR_PIPELINE_ORDER = Field.create("cursor.pipeline.order")
             .withDisplayName("Change stream cursor pipeline order")
             .withEnum(CursorPipelineOrder.class, CursorPipelineOrder.INTERNAL_FIRST)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 5))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 6))
             .withWidth(Width.SHORT)
             .withImportance(Importance.MEDIUM)
             .withDescription("The order used to construct the effective MongoDB aggregation stream pipeline "
@@ -900,7 +953,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public static final Field CURSOR_OVERSIZE_HANDLING_MODE = Field.create("cursor.oversize.handling.mode")
             .withDisplayName("Oversize document handling mode")
             .withEnum(OversizeHandlingMode.class, OversizeHandlingMode.FAIL)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 6))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 7))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDescription("The strategy used to handle change events for documents exceeding specified BSON size. "
@@ -912,7 +965,7 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public static final Field CURSOR_OVERSIZE_SKIP_THRESHOLD = Field.create("cursor.oversize.skip.threshold")
             .withDisplayName("Oversize document skip threshold")
             .withType(Type.INT)
-            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 7))
+            .withGroup(Field.createGroupEntry(Field.Group.CONNECTOR_ADVANCED, 8))
             .withWidth(Width.SHORT)
             .withImportance(Importance.LOW)
             .withDefault(0)
@@ -938,7 +991,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
             .type(
                     TOPIC_PREFIX,
                     CONNECTION_STRING,
-                    CONNECTION_MODE,
                     ALLOW_OFFSET_INVALIDATION,
                     USER,
                     PASSWORD,
@@ -975,17 +1027,31 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         return CONFIG_DEFINITION.configDef();
     }
 
-    protected static Field.Set EXPOSED_FIELDS = ALL_FIELDS;
-
     private final SnapshotMode snapshotMode;
-    private CaptureMode captureMode;
+    private final CaptureMode captureMode;
+    private final FullUpdateType captureModeFullUpdateType;
     private final CaptureScope captureScope;
     private final String captureTarget;
-    private final ConnectionMode connectionMode;
     private final boolean offsetInvalidationAllowed;
     private final int snapshotMaxThreads;
     private final int cursorMaxAwaitTimeMs;
-    private final ReplicaSets replicaSets;
+    private final ConnectionString connectionString;
+    private final String user;
+    private final String password;
+    private final String authSource;
+    private final MongoDbAuthProvider authProvider;
+    private final boolean sslEnabled;
+    private final boolean sslAllowInvalidHostnames;
+    private final String sslKeyStore;
+    private final String sslKeyStorePassword;
+    private final String sslKeyStoreType;
+    private final String sslTrustStore;
+    private final String sslTrustStorePassword;
+    private final String sslTrustStoreType;
+    private final int connectTimeoutMs;
+    private final int heartbeatFrequencyMs;
+    private final int socketTimeoutMs;
+    private final int serverSelectionTimeoutMs;
     private final CursorPipelineOrder cursorPipelineOrder;
     private final OversizeHandlingMode oversizeHandlingMode;
     private final FiltersMatchMode filtersMatchMode;
@@ -994,15 +1060,35 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public MongoDbConnectorConfig(Configuration config) {
         super(config, DEFAULT_SNAPSHOT_FETCH_SIZE);
 
+        // Connection configuration
+        this.authProvider = config.getInstance(MongoDbConnectorConfig.AUTH_PROVIDER_CLASS, MongoDbAuthProvider.class);
+        this.sslEnabled = config.getBoolean(MongoDbConnectorConfig.SSL_ENABLED);
+        this.sslAllowInvalidHostnames = config.getBoolean(MongoDbConnectorConfig.SSL_ALLOW_INVALID_HOSTNAMES);
+        this.sslKeyStore = config.getString(MongoDbConnectorConfig.SSL_KEYSTORE);
+        this.sslKeyStorePassword = config.getString(MongoDbConnectorConfig.SSL_KEYSTORE_PASSWORD);
+        this.sslKeyStoreType = config.getString(MongoDbConnectorConfig.SSL_KEYSTORE_TYPE);
+        this.sslTrustStore = config.getString(MongoDbConnectorConfig.SSL_TRUSTSTORE);
+        this.sslTrustStorePassword = config.getString(MongoDbConnectorConfig.SSL_TRUSTSTORE_PASSWORD);
+        this.sslTrustStoreType = config.getString(MongoDbConnectorConfig.SSL_TRUSTSTORE_TYPE);
+
+        this.connectTimeoutMs = config.getInteger(MongoDbConnectorConfig.CONNECT_TIMEOUT_MS);
+        this.heartbeatFrequencyMs = config.getInteger(MongoDbConnectorConfig.HEARTBEAT_FREQUENCY_MS);
+        this.socketTimeoutMs = config.getInteger(MongoDbConnectorConfig.SOCKET_TIMEOUT_MS);
+        this.serverSelectionTimeoutMs = config.getInteger(MongoDbConnectorConfig.SERVER_SELECTION_TIMEOUT_MS);
+        this.connectionString = resolveConnectionString(config);
+        this.user = config.getString(MongoDbConnectorConfig.USER);
+        this.password = config.getString(MongoDbConnectorConfig.PASSWORD);
+        this.authSource = config.getString(MongoDbConnectorConfig.AUTH_SOURCE);
+
+        // Other configuration
         String snapshotModeValue = config.getString(MongoDbConnectorConfig.SNAPSHOT_MODE);
         this.snapshotMode = SnapshotMode.parse(snapshotModeValue, MongoDbConnectorConfig.SNAPSHOT_MODE.defaultValueAsString());
 
         String captureModeValue = config.getString(MongoDbConnectorConfig.CAPTURE_MODE);
         this.captureMode = CaptureMode.parse(captureModeValue, MongoDbConnectorConfig.CAPTURE_MODE.defaultValueAsString());
+        String fullUpdateTypeValue = config.getString(MongoDbConnectorConfig.CAPTURE_MODE_FULL_UPDATE_TYPE);
+        this.captureModeFullUpdateType = FullUpdateType.parse(fullUpdateTypeValue, MongoDbConnectorConfig.CAPTURE_MODE_FULL_UPDATE_TYPE.defaultValueAsString());
 
-        String connectionModeValue = config.getString(MongoDbConnectorConfig.CONNECTION_MODE);
-        this.connectionMode = ConnectionMode.parse(connectionModeValue, MongoDbConnectorConfig.CONNECTION_MODE.defaultValueAsString());
-        this.shardConnectionParameters = config.getString(SHARD_CONNECTION_PARAMS);
         this.offsetInvalidationAllowed = config.getBoolean(ALLOW_OFFSET_INVALIDATION);
 
         String captureScopeValue = config.getString(MongoDbConnectorConfig.CAPTURE_SCOPE);
@@ -1021,31 +1107,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
 
         this.snapshotMaxThreads = resolveSnapshotMaxThreads(config);
         this.cursorMaxAwaitTimeMs = config.getInteger(MongoDbConnectorConfig.CURSOR_MAX_AWAIT_TIME_MS, 0);
-
-        this.replicaSets = resolveReplicaSets(config);
-    }
-
-    private static int validateHosts(Configuration config, Field field, ValidationOutput problems) {
-        String hosts = config.getString(field);
-        String connectionString = config.getString(CONNECTION_STRING);
-
-        if (hosts == null) {
-            return 0;
-        }
-
-        LOGGER.warn("Config property '{}' will be removed in the future, use '{}' instead", field.name(), CONNECTION_STRING.name());
-
-        if (connectionString != null) {
-            LOGGER.warn("Config property '{}' is ignored, property '{}' takes precedence", field.name(), CONNECTION_STRING.name());
-            return 0;
-        }
-
-        if (ConnectionStrings.parseFromHosts(hosts).isEmpty()) {
-            problems.accept(field, null, "Invalid host specification");
-            return 1;
-        }
-
-        return 0;
     }
 
     private static int validateChangeStreamPipeline(Configuration config, Field field, ValidationOutput problems) {
@@ -1191,6 +1252,10 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         return captureMode;
     }
 
+    public FullUpdateType getCaptureModeFullUpdateType() {
+        return captureModeFullUpdateType;
+    }
+
     public CaptureScope getCaptureScope() {
         return captureScope;
     }
@@ -1199,20 +1264,84 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         return Optional.ofNullable(captureTarget);
     }
 
-    public ConnectionMode getConnectionMode() {
-        return connectionMode;
-    }
-
     public boolean isOffsetInvalidationAllowed() {
         return offsetInvalidationAllowed;
     }
 
-    public String getShardConnectionParameters() {
-        return shardConnectionParameters;
+    public ConnectionString getConnectionString() {
+        return connectionString;
     }
 
-    public ReplicaSets getReplicaSets() {
-        return replicaSets;
+    public String getUser() {
+        return user;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    public String getAuthSource() {
+        return authSource;
+    }
+
+    public int getCursorMaxAwaitTimeMs() {
+        return cursorMaxAwaitTimeMs;
+    }
+
+    public MongoDbAuthProvider getAuthProvider() {
+        return authProvider;
+    }
+
+    public boolean isSslEnabled() {
+        return sslEnabled;
+    }
+
+    public boolean isSslAllowInvalidHostnames() {
+        return sslAllowInvalidHostnames;
+    }
+
+    public Optional<Path> getSslKeyStore() {
+        return Optional.ofNullable(sslKeyStore)
+                .filter(not(Strings::isNullOrBlank))
+                .map(Path::of);
+    }
+
+    public char[] getSslKeyStorePassword() {
+        return sslKeyStorePassword != null ? sslKeyStorePassword.toCharArray() : null;
+    }
+
+    public String getSslKeyStoreType() {
+        return sslKeyStoreType;
+    }
+
+    public Optional<Path> getSslTrustStore() {
+        return Optional.ofNullable(sslTrustStore)
+                .filter(not(Strings::isNullOrBlank))
+                .map(Path::of);
+    }
+
+    public char[] getSslTrustStorePassword() {
+        return sslTrustStorePassword != null ? sslTrustStorePassword.toCharArray() : null;
+    }
+
+    public String getSslTrustStoreType() {
+        return sslTrustStoreType;
+    }
+
+    public int getConnectTimeoutMs() {
+        return connectTimeoutMs;
+    }
+
+    public int getHeartbeatFrequencyMs() {
+        return heartbeatFrequencyMs;
+    }
+
+    public int getSocketTimeoutMs() {
+        return socketTimeoutMs;
+    }
+
+    public int getServerSelectionTimeoutMs() {
+        return serverSelectionTimeoutMs;
     }
 
     public int getCursorMaxAwaitTime() {
@@ -1289,13 +1418,9 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
         return config.getInteger(SNAPSHOT_MAX_THREADS);
     }
 
-    private static ReplicaSets resolveReplicaSets(Configuration config) {
-        if (!config.hasKey(MongoDbConnectorConfig.TASK_CONNECTION_STRINGS)) {
-            return new ReplicaSets(List.of());
-        }
-
-        var replicaSetSpecs = config.getList(MongoDbConnectorConfig.TASK_CONNECTION_STRINGS, ReplicaSets.SEPARATOR, ReplicaSet::new);
-        return new ReplicaSets(replicaSetSpecs);
+    private static ConnectionString resolveConnectionString(Configuration config) {
+        var connectionString = config.getString(MongoDbConnectorConfig.CONNECTION_STRING);
+        return new ConnectionString(connectionString);
     }
 
     @Override
@@ -1327,6 +1452,6 @@ public class MongoDbConnectorConfig extends CommonConnectorConfig {
     public boolean isSignalDataCollection(DataCollectionId dataCollectionId) {
         final CollectionId id = (CollectionId) dataCollectionId;
         return getSignalingDataCollectionId() != null
-                && getSignalingDataCollectionId().equals(id.dbName() + "." + id.name());
+                && Objects.equals(CollectionId.parse(getSignalingDataCollectionId()), id);
     }
 }

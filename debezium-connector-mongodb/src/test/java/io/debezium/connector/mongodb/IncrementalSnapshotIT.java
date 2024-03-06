@@ -17,6 +17,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -31,6 +32,7 @@ import java.util.stream.Collectors;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.awaitility.Awaitility;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.bson.types.ObjectId;
 import org.junit.After;
@@ -95,7 +97,7 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
                 .with(MongoDbConnectorConfig.SIGNAL_DATA_COLLECTION, SIGNAL_COLLECTION_NAME)
                 .with(MongoDbConnectorConfig.SIGNAL_POLL_INTERVAL_MS, 5)
                 .with(MongoDbConnectorConfig.INCREMENTAL_SNAPSHOT_CHUNK_SIZE, 10)
-                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NEVER);
+                .with(MongoDbConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA);
     }
 
     protected String dataCollectionName() {
@@ -354,14 +356,20 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
 
         var serialization = new JsonSerialization();
 
-        var expected = documents.values()
-                .stream()
-                .map(d -> d.toBsonDocument())
-                .collect(toMap(
-                        d -> serialization.getDocumentId(d),
-                        d -> d.getInt32(valueFieldName()).getValue()));
+        try (var connection = connect()) {
+            var codecs = connection.getDatabase(DATABASE_NAME)
+                    .getCollection(COLLECTION_NAME)
+                    .getCodecRegistry();
 
-        assertThat(dbChanges).containsAllEntriesOf(expected);
+            var expected = documents.values()
+                    .stream()
+                    .map(d -> d.toBsonDocument(BsonDocument.class, codecs))
+                    .collect(toMap(
+                            serialization::getDocumentId,
+                            d -> d.getInt32(valueFieldName()).getValue()));
+
+            assertThat(dbChanges).containsAllEntriesOf(expected);
+        }
     }
 
     @Test
@@ -411,6 +419,11 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
     }
 
     @Test
+    public void snapshotOnlyUUID() throws Exception {
+        snapshotOnly(UUID.randomUUID(), k -> UUID.randomUUID());
+    }
+
+    @Test
     public void snapshotOnlyString() throws Exception {
         Supplier<String> keySupplier = () -> java.util.UUID.randomUUID().toString();
         snapshotOnly(keySupplier.get(), k -> keySupplier.get());
@@ -451,7 +464,7 @@ public class IncrementalSnapshotIT extends AbstractMongoConnectorIT {
 
         Awaitility.await().atMost(60, TimeUnit.SECONDS)
                 .until(() -> interceptor
-                        .containsMessage("No data returned by the query, incremental snapshotting of table '" + "rs0." + fullDataCollectionName() + "' finished"));
+                        .containsMessage("No data returned by the query, incremental snapshotting of table '" + fullDataCollectionName() + "' finished"));
 
         final int expectedRecordCount = ROW_COUNT;
         final AtomicInteger recordCounter = new AtomicInteger();

@@ -22,6 +22,7 @@ import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.Before;
 import org.junit.Test;
 
+import io.debezium.config.CommonConnectorConfig.EventConvertingFailureHandlingMode;
 import io.debezium.config.Configuration;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
@@ -682,5 +683,74 @@ public class TableSchemaBuilderTest {
         assertThat(schema.keySchema().name()).isEqualTo("testSchemaPrefix.Key");
         assertThat(schema.valueSchema().name()).isEqualTo("testSchemaPrefix.Value");
         assertThat(schema.getEnvelopeSchema().schema().name()).isEqualTo("testDataTopic.Envelope");
+    }
+
+    @Test
+    @FixFor("DBZ-7143")
+    public void shouldLogMessageOrThrowExceptionWhenConversionIsFailed() {
+        LogInterceptor logInterceptor = new LogInterceptor(TableSchemaBuilder.class);
+
+        // converter should be failed because C4 column is COUNTER(INTEGER) type but value is string type("converting_failed_value")
+        Object[] data = new Object[]{ "c1value", 3.142d, null, "converting_failed_value", null, null, null,
+                null, null, null };
+        String errorMessage = "Failed to properly convert data value for 'catalog.schema.table.C4' of type COUNTER";
+
+        // only error log without exception if eventConvertingFailureHandlingMode is null
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), null, adjuster, customConverterRegistry,
+                SchemaBuilder.struct().build(), defaultFieldNamer, false, null)
+                .create(topicNamingStrategy, table, null, null, null);
+        try {
+            schema.valueFromColumnData(data);
+        }
+        catch (Exception e) {
+            fail();
+        }
+
+        assertThat(logInterceptor.containsErrorMessage(errorMessage)).isTrue();
+        logInterceptor.clear();
+
+        // error log and exception if eventConvertingFailureHandlingMode is FAIL
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), null, adjuster, customConverterRegistry,
+                SchemaBuilder.struct().build(), defaultFieldNamer, false, EventConvertingFailureHandlingMode.FAIL)
+                .create(topicNamingStrategy, table, null, null, null);
+
+        try {
+            schema.valueFromColumnData(data);
+            fail();
+        }
+        catch (Exception e) {
+            assertThat(e.getMessage().contains(errorMessage)).isTrue();
+        }
+
+        // warn log without exception if eventConvertingFailureHandlingMode is WARN
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), null, adjuster, customConverterRegistry,
+                SchemaBuilder.struct().build(), defaultFieldNamer, false, EventConvertingFailureHandlingMode.WARN)
+                .create(topicNamingStrategy, table, null, null, null);
+
+        try {
+            schema.valueFromColumnData(data);
+        }
+        catch (Exception e) {
+            fail();
+        }
+
+        assertThat(logInterceptor.containsWarnMessage(errorMessage)).isTrue();
+        logInterceptor.clear();
+
+        // only debug log without exception if eventConvertingFailureHandlingMode is SKIP
+        schema = new TableSchemaBuilder(new JdbcValueConverters(), null, adjuster, customConverterRegistry,
+                SchemaBuilder.struct().build(), defaultFieldNamer, false, EventConvertingFailureHandlingMode.SKIP)
+                .create(topicNamingStrategy, table, null, null, null);
+
+        try {
+            schema.valueFromColumnData(data);
+        }
+        catch (Exception e) {
+            fail();
+        }
+
+        assertThat(logInterceptor.containsErrorMessage(errorMessage)).isFalse();
+        assertThat(logInterceptor.containsWarnMessage(errorMessage)).isFalse();
+        logInterceptor.clear();
     }
 }

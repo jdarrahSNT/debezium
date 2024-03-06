@@ -21,7 +21,7 @@ import org.junit.Test;
 import io.debezium.config.Configuration;
 import io.debezium.data.VerifyRecord;
 import io.debezium.doc.FixFor;
-import io.debezium.embedded.AbstractConnectorTest;
+import io.debezium.embedded.async.AbstractAsyncEngineConnectorTest;
 import io.debezium.junit.EqualityCheck;
 import io.debezium.junit.SkipWhenKafkaVersion;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
@@ -32,7 +32,7 @@ import io.debezium.util.Testing;
  *
  * @author René Kerner
  */
-public class MySqlDecimalIT extends AbstractConnectorTest {
+public class MySqlDecimalIT extends AbstractAsyncEngineConnectorTest {
 
     private static final String TABLE_NAME = "DBZ730";
 
@@ -49,7 +49,7 @@ public class MySqlDecimalIT extends AbstractConnectorTest {
         DATABASE.createAndInitialize();
         initializeConnectorTestFramework();
         Testing.Files.delete(SCHEMA_HISTORY_PATH);
-        // TODO: remove once https://github.com/Apicurio/apicurio-registry/issues/2980 is fixed
+        // TODO: remove once we upgrade Apicurio version (DBZ-7357)
         if (VerifyRecord.isApucurioAvailable()) {
             skipAvroValidation();
         }

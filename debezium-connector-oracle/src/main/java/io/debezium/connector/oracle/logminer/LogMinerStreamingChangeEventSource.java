@@ -50,10 +50,10 @@ import io.debezium.pipeline.txmetadata.TransactionContext;
 import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
+import io.debezium.snapshot.SnapshotterService;
 import io.debezium.util.Clock;
 import io.debezium.util.Metronome;
 import io.debezium.util.Stopwatch;
-import io.debezium.util.Strings;
 
 /**
  * A {@link StreamingChangeEventSource} based on Oracle's LogMiner utility.
@@ -92,11 +92,13 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
     private OracleOffsetContext effectiveOffset;
     private int currentBatchSize;
     private long currentSleepTime;
+    private final SnapshotterService snapshotterService;
 
     public LogMinerStreamingChangeEventSource(OracleConnectorConfig connectorConfig,
                                               OracleConnection jdbcConnection, EventDispatcher<OraclePartition, TableId> dispatcher,
                                               ErrorHandler errorHandler, Clock clock, OracleDatabaseSchema schema,
-                                              Configuration jdbcConfig, LogMinerStreamingChangeEventSourceMetrics streamingMetrics) {
+                                              Configuration jdbcConfig, LogMinerStreamingChangeEventSourceMetrics streamingMetrics,
+                                              SnapshotterService snapshotterService) {
         this.jdbcConnection = jdbcConnection;
         this.dispatcher = dispatcher;
         this.clock = clock;
@@ -107,14 +109,15 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
         this.errorHandler = errorHandler;
         this.streamingMetrics = streamingMetrics;
         this.jdbcConfiguration = JdbcConfiguration.adapt(jdbcConfig);
-        this.archiveLogRetention = connectorConfig.getLogMiningArchiveLogRetention();
+        this.archiveLogRetention = connectorConfig.getArchiveLogRetention();
         this.archiveLogOnlyMode = connectorConfig.isArchiveLogOnlyMode();
-        this.archiveDestinationName = connectorConfig.getLogMiningArchiveDestinationName();
+        this.archiveDestinationName = connectorConfig.getArchiveLogDestinationName();
         this.logFileQueryMaxRetries = connectorConfig.getMaximumNumberOfLogQueryRetries();
         this.initialDelay = connectorConfig.getLogMiningInitialDelay();
         this.maxDelay = connectorConfig.getLogMiningMaxDelay();
         this.currentBatchSize = connectorConfig.getLogMiningBatchSizeDefault();
         this.currentSleepTime = connectorConfig.getLogMiningSleepTimeDefault().toMillis();
+        this.snapshotterService = snapshotterService;
 
         this.streamingMetrics.setBatchSize(this.currentBatchSize);
         this.streamingMetrics.setSleepTime(this.currentSleepTime);
@@ -140,18 +143,22 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
      */
     @Override
     public void execute(ChangeEventSourceContext context, OraclePartition partition, OracleOffsetContext offsetContext) {
-        if (!connectorConfig.getSnapshotMode().shouldStream()) {
+
+        if (!snapshotterService.getSnapshotter().shouldStream()) { // TODO check with DBZ-7308 if this can be moved up
             LOGGER.info("Streaming is not enabled in current configuration");
             return;
         }
+
         try {
 
             prepareConnection(false);
 
             this.effectiveOffset = offsetContext;
-            startScn = offsetContext.getScn();
+            startScn = connectorConfig.getAdapter().getOffsetScn(this.effectiveOffset);
             snapshotScn = offsetContext.getSnapshotScn();
-            Scn firstScn = getFirstScnInLogs(jdbcConnection);
+            Scn firstScn = jdbcConnection.getFirstScnInLogs(archiveLogRetention, archiveDestinationName)
+                    .orElseThrow(() -> new DebeziumException("Failed to calculate oldest SCN available in logs"));
+
             if (startScn.compareTo(snapshotScn) == 0) {
                 // This is the initial run of the streaming change event source.
                 // We need to compute the correct start offset for mining. That is not the snapshot offset,
@@ -168,7 +175,6 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                 }
 
                 checkDatabaseAndTableState(jdbcConnection, connectorConfig.getPdbName(), schema);
-                checkArchiveLogDestination(jdbcConnection, connectorConfig.getLogMiningArchiveDestinationName());
                 logOnlineRedoLogSizes(connectorConfig);
 
                 try (LogMinerEventProcessor processor = createProcessor(context, partition, offsetContext)) {
@@ -387,23 +393,6 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
                                                    OracleOffsetContext offsetContext) {
         final LogMiningBufferType bufferType = connectorConfig.getLogMiningBufferType();
         return bufferType.createProcessor(context, connectorConfig, jdbcConnection, dispatcher, partition, offsetContext, schema, streamingMetrics);
-    }
-
-    /**
-     * Gets the first system change number in both archive and redo logs.
-     *
-     * @param connection database connection, should not be {@code null}
-     * @return the oldest system change number
-     * @throws SQLException if a database exception occurred
-     * @throws DebeziumException if the oldest system change number cannot be found due to no logs available
-     */
-    private Scn getFirstScnInLogs(OracleConnection connection) throws SQLException {
-        String oldestScn = connection.singleOptionalValue(SqlUtils.oldestFirstChangeQuery(archiveLogRetention, archiveDestinationName), rs -> rs.getString(1));
-        if (oldestScn == null) {
-            throw new DebeziumException("Failed to calculate oldest SCN available in logs");
-        }
-        LOGGER.trace("Oldest SCN in logs is '{}'", oldestScn);
-        return Scn.valueOf(oldestScn);
     }
 
     private void initializeRedoLogsForMining(OracleConnection connection, boolean postEndMiningSession, Scn startScn)
@@ -680,19 +669,21 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
     }
 
     private void updateBatchSize(boolean increment) {
-        if (increment && currentBatchSize < connectorConfig.getLogMiningBatchSizeMin()) {
-            currentBatchSize += connectorConfig.getLogMiningBatchSizeMin();
-            if (currentBatchSize == connectorConfig.getLogMiningBatchSizeMax()) {
+        int batchSizeMin = connectorConfig.getLogMiningBatchSizeMin();
+        int batchSizeMax = connectorConfig.getLogMiningBatchSizeMax();
+        if (increment && currentBatchSize < batchSizeMax) {
+            currentBatchSize = Math.min(currentBatchSize + batchSizeMin, batchSizeMax);
+            if (currentBatchSize == batchSizeMax) {
                 LOGGER.info("The connector is now using the maximum batch size {} when querying the LogMiner view.{}",
                         currentBatchSize,
                         connectorConfig.isLobEnabled() ? "" : " This could be indicate of a large SCN gap.");
             }
         }
-        else if (!increment && currentBatchSize > connectorConfig.getLogMiningBatchSizeMin()) {
-            currentBatchSize -= connectorConfig.getLogMiningBatchSizeMin();
+        else if (!increment && currentBatchSize > batchSizeMin) {
+            currentBatchSize = Math.max(currentBatchSize - batchSizeMin, batchSizeMin);
         }
 
-        if (currentBatchSize != connectorConfig.getLogMiningBatchSizeMax()) {
+        if (currentBatchSize != batchSizeMax) {
             LOGGER.debug("Updated batch size window, using batch size {}", currentBatchSize);
         }
 
@@ -920,21 +911,6 @@ public class LogMinerStreamingChangeEventSource implements StreamingChangeEventS
             }
         }
         LOGGER.trace("Database and table state check finished after {} ms", Duration.between(start, Instant.now()).toMillis());
-    }
-
-    private void checkArchiveLogDestination(OracleConnection connection, String destinationName) throws SQLException {
-        if (!Strings.isNullOrBlank(destinationName)) {
-            if (!connection.isArchiveLogDestinationValid(destinationName)) {
-                LOGGER.warn("Archive log destination '{}' may not be valid, please check the database.", destinationName);
-            }
-        }
-        else {
-            if (!connection.isOnlyOneArchiveLogDestinationValid()) {
-                LOGGER.warn("There are multiple valid archive log destinations. " +
-                        "Please add '{}' to the connector configuration to avoid log availability problems.",
-                        OracleConnectorConfig.LOG_MINING_ARCHIVE_DESTINATION_NAME.name());
-            }
-        }
     }
 
     /**
